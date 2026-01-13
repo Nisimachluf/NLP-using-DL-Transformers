@@ -1,0 +1,7 @@
+model,parameters,hidden_size,num_attention_heads,num_hidden_layers,vocab_size
+FacebookAI/roberta-base,124650246,768,12,12,50265
+FacebookAI/roberta-large,355365894,1024,16,24,50265
+google/electra-base-discriminator,109486854,768,12,12,30522
+google/electra-large-discriminator,335148038,1024,16,24,30522
+google/electra-small-discriminator,13550342,256,4,12,30522
+microsoft/deberta-base,139196934,768,12,12,50265

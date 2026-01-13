@@ -1,0 +1,12 @@
+transformers
+ipykernel
+torch
+ipywidgets
+datasets
+evaluate
+scikit-learn
+matplotlib
+seaborn
+accelerate
+optuna
+python-dotenv
