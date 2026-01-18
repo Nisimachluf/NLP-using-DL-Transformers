@@ -1,0 +1,4 @@
+Sentence,labels
+i am not amazing or great at photography but i feel passionate about it,Joy/Love
+i feel a remembrance of the strange by justin aryiku falls into the latter category,Surprise/Fear
+i was sitting in the corner stewing in my own muck feeling hated alone unworthy and violated,Sadness/Anger

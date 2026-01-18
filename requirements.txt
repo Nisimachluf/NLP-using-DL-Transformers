@@ -10,3 +10,7 @@ seaborn
 accelerate
 optuna
 python-dotenv
+contractions
+ekphrasis
+beautifulsoup4
+lxml

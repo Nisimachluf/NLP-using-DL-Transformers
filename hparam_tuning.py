@@ -3,18 +3,22 @@ import os.path as osp
 import json
 import optuna
 from transformers import Trainer, TrainingArguments, AutoTokenizer, DataCollatorWithPadding, EarlyStoppingCallback
-from utils import load_hf_classifier, get_metrics_fn, preprocess, calc_class_weights, WeightedTrainer
+
+from data_utils import preprocess
+from utils import load_hf_classifier, get_metrics_fn, calc_class_weights, WeightedTrainer
 
 def hp_space(trial):
-    return {
+    param_set =  {
         "learning_rate": trial.suggest_float("learning_rate", 5e-6, 1e-4, log=True),
-        "num_train_epochs": trial.suggest_int("num_train_epochs", 5, 15),
+        "num_train_epochs": trial.suggest_int("num_train_epochs", 10, 20),
         # "per_device_train_batch_size": trial.suggest_categorical(
-            # "per_device_train_batch_size", [8, 16, 32, 64]
+        #     "per_device_train_batch_size", [4, 8, 16, 32, 64, 128]
         # ),
         "warmup_ratio": trial.suggest_float("warmup_ratio", 0.0, 0.1),
         "weight_decay": trial.suggest_float("weight_decay", 0.0, 0.02),
     }
+    print(param_set)
+    return param_set
 
 def compute_objective(metrics):
     return metrics["eval_f1"]   # or eval_loss (minimize)

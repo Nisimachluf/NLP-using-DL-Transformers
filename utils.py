@@ -7,8 +7,10 @@ import numpy as np
 import os.path as osp
 from shutil import copyfile, rmtree
 from torch.nn import CrossEntropyLoss
-from datasets import load_dataset, DatasetDict, ClassLabel
+from datasets import load_dataset, DatasetDict, ClassLabel, 
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, TrainerCallback, Trainer, DataCollatorWithPadding, EarlyStoppingCallback, TrainingArguments
+
+from data_utils import preprocess
 
 def load_csv_to_dataset(train_path, test_path, label_mapping_path='classes.json'):
     """
@@ -41,80 +43,6 @@ def load_csv_to_dataset(train_path, test_path, label_mapping_path='classes.json'
     dataset = dataset.cast_column('label', ClassLabel(names=label_names))
     
     return dataset
-
-
-def preprocess(dataset, tokenizer, validation_size=0.2, random_state=42):
-    """
-    Preprocess dataset by adding token length column and creating stratified train/validation splits.
-    
-    Args:
-        dataset: DatasetDict from load_csv_to_dataset
-        tokenizer: HuggingFace tokenizer
-        validation_size: Proportion of training data to use for validation (default: 0.2)
-        random_state: Random seed for reproducibility (default: 42)
-    
-    Returns:
-        DatasetDict: Processed dataset with 'train', 'validation', and 'test' splits
-    """
-    
-    # Add length column to all splits
-    def add_length(examples):
-        examples['length'] = [len(tokenizer.encode(text)) for text in examples['text']]
-        return examples
-    
-    def preprocess_function(examples):
-        return tokenizer(examples["text"], truncation=True)
-    
-    dataset = dataset.map(add_length, batched=True)
-    
-    # Create stratified train/validation split based on label and length bins
-    train_dataset = dataset['train']
-    
-    # Calculate decile boundaries for length
-    all_lengths = train_dataset['length']
-    deciles = np.percentile(all_lengths, np.arange(0, 101, 10))
-    
-    # Add a combined stratification column (label + length decile)
-    def add_strat_column(examples):
-        strat_keys = []
-        for label, length in zip(examples['label'], examples['length']):
-            # Assign to decile bin (0-9)
-            length_bin = np.digitize(length, deciles[1:-1])  # Exclude 0% and 100%
-            # ClassLabel stores values as integers internally
-            strat_key = f"{label}_{length_bin}"
-            strat_keys.append(strat_key)
-        examples['strat_key'] = strat_keys
-        return examples
-    
-    train_dataset = train_dataset.map(add_strat_column, batched=True)
-    
-    # Convert strat_key to ClassLabel for stratification
-    unique_strat_keys = sorted(set(train_dataset['strat_key']))
-    train_dataset = train_dataset.cast_column(
-        'strat_key',
-        ClassLabel(names=unique_strat_keys)
-    )
-    
-    # Perform stratified split
-    split_dataset = train_dataset.train_test_split(
-        test_size=validation_size,
-        stratify_by_column='strat_key',
-        seed=random_state
-    )
-    
-    # Remove the temporary stratification column
-    split_dataset['train'] = split_dataset['train'].remove_columns(['strat_key'])
-    split_dataset['validation'] = split_dataset['test'].remove_columns(['strat_key'])
-    
-    # Create final DatasetDict with train, validation, and test
-    processed_dataset = DatasetDict({
-        'train': split_dataset['train'],
-        'validation': split_dataset['validation'],
-        'test': dataset['test']
-    })
-    
-    processed_dataset = processed_dataset.map(preprocess_function, batched=True)
-    return processed_dataset
 
 
 def load_label_mapping(json_path='classes.json'):
@@ -265,11 +193,146 @@ def create_model_stats_csv(trained_weights_dir='trained_weights', output_csv='mo
     print(f"Model statistics saved to {output_csv}")
 
 
+def predict_on_dataset(model_path, dataset, split='test', batch_size=32, device=None, cache_file='predictions_cache.json'):
+    """
+    Load a model and make predictions on a dataset split.
+    
+    Args:
+        model_path: Path to the saved model directory
+        dataset: HuggingFace Dataset or DatasetDict
+        split: Name of the split to predict on (default: 'test')
+        batch_size: Batch size for inference (default: 32)
+        device: Device to use ('cuda' or 'cpu'). If None, auto-detects.
+        cache_file: Path to JSON file for caching results (default: 'predictions_cache.json')
+    
+    Returns:
+        dict: Dictionary containing:
+            - 'predictions': list of predicted class indices
+            - 'labels': list of true labels (if available)
+            - 'metrics': dict with accuracy, recall, precision, f1 scores (if labels available)
+            - 'total_time': total inference time in seconds
+            - 'time_per_sample': average time in seconds per sample
+    """
+    import time
+    
+    # Extract model name from path for caching
+    model_name = "-".join(model_path.split('/')[-1].split("-")[:2])
+    cache_key = f"{model_name}"
+    
+    # Check if results are already cached
+    if os.path.exists(cache_file):
+        with open(cache_file, 'r') as f:
+            cache = json.load(f)
+        if cache_key in cache and split in cache[cache_key]:
+            print(f"Loading cached results for {cache_key}")
+            return cache[cache_key][split]
+    else:
+        cache = {}
+    
+    # Auto-detect device if not specified
+    if device is None:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    
+    # Load model and tokenizer using load_hf_classifier
+    model, tokenizer = load_hf_classifier(model_path, n_classes=6, training=False)
+    
+    model.to(device)
+    
+    # Get the dataset split
+    if isinstance(dataset, DatasetDict):
+        data = dataset[split]
+    else:
+        data = dataset
+    
+    # Prepare for inference
+    all_predictions = []
+    all_probabilities = []
+    all_labels = []
+    
+    # Track inference time
+    start_time = time.time()
+    
+    # Process in batches
+    for i in range(0, len(data), batch_size):
+        batch_end = min(i + batch_size, len(data))
+        batch_texts = data['text'][i:batch_end]
+        
+        # Tokenize batch with padding to longest in batch
+        tokenized = tokenizer(
+            batch_texts,
+            truncation=True,
+            padding=True,  # Pad to longest in batch
+            max_length=512,
+            return_tensors='pt'
+        )
+        
+        # Move inputs to device
+        inputs = {k: v.to(device) for k, v in tokenized.items()}
+        
+        # Get predictions
+        with torch.no_grad():
+            outputs = model(**inputs)
+            logits = outputs.logits
+            probs = torch.softmax(logits, dim=-1)
+            preds = torch.argmax(logits, dim=-1)
+        
+        all_predictions.extend(preds.cpu().numpy().tolist())
+        all_probabilities.extend(probs.cpu().numpy())
+        
+        # Collect labels if available
+        if 'label' in data.features:
+            all_labels.extend(data['label'][i:batch_end])
+    
+    # Calculate total time and time per sample
+    total_time = time.time() - start_time
+    time_per_sample = total_time / len(data)
+    
+    result = {
+        'predictions': all_predictions,
+        'total_time': total_time,
+        'time_per_sample': time_per_sample
+    }
+    
+    if all_labels:
+        result['labels'] = all_labels
+        
+        # Calculate metrics if labels are available
+        compute_metrics = get_metrics_fn()
+        metrics = compute_metrics((np.array(all_probabilities), np.array(all_labels)))
+        result['metrics'] = metrics
+    
+    # Save to cache with compact format for lists
+    if cache_key not in cache:
+        cache[cache_key] = {}
+    cache[cache_key][split] = result
+    with open(cache_file, 'w') as f:
+        json.dump(cache, f, indent=2, separators=(',', ': '))
+    
+    # Rewrite with compact lists
+    with open(cache_file, 'r') as f:
+        content = f.read()
+    
+    # Replace multiline lists with single-line compact format
+    import re
+    # Match predictions or labels arrays that span multiple lines
+    content = re.sub(
+        r'"(predictions|labels)":\s*\[\s*((?:\d+,?\s*)+)\]',
+        lambda m: f'"{m.group(1)}": [{", ".join(m.group(2).replace(",", "").split())}]',
+        content,
+        flags=re.MULTILINE | re.DOTALL
+    )
+    
+    with open(cache_file, 'w') as f:
+        f.write(content)
+    
+    return result
+
+
 class CSVLoggingCallback(TrainerCallback):
     def __init__(self, output_dir):
         self.filepath = os.path.join(output_dir, "training_log.csv")
         self.initialized = False
-        self.fieldnames = ["epoch", "step", "eval_loss", "eval_accuracy", "eval_recall", "eval_precision", "eval_f1"]
+        self.fieldnames = ["epoch", "step", "train_loss", "eval_loss", "eval_accuracy", "eval_recall", "eval_precision", "eval_f1"]
         self.buffer = {}
     
     def is_full(self):
