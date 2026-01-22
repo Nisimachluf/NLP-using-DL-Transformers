@@ -497,23 +497,23 @@ def count_text_differences(string1, string2):
     pos = int(len(string1) < 221  and len(string2) < 221)
     return (additions + deletions + replacements)*pos
     
-def show_diff(dataset, fname=None):
+def show_diff(dataset, n_cases=5, fname=None):
     df = dataset["train"].to_pandas()
     df = df[df["is_cleaned"]]
     df["l"] = df.apply(lambda x: count_text_differences(x["text"], x["cleaned"]), axis=1)
     df = df.sort_values("l", ascending=False)
     diffs = []
-    for idx, (t1, t2) in enumerate(zip(df.text.tolist(), df.cleaned.tolist())):
-        print(" | ".join(highlight_text_diff(t1, t2)))
-        if idx == 5:
+    for idx, (t1, t2) in enumerate(zip(df.text.tolist(), df.cleaned.tolist()), 1):
+        s1, s2 = highlight_text_diff(t1, t2)
+        p = f"{idx}) {s1}\n"
+        p = p+ ' '*(len(str({idx}))) + f"{s2}"
+        print(p)
+        if idx == n_cases:
             break
         diffs.append((t1, t2))
     if fname is not None:
-        print(fname)
         fpath = f"examples/data_cleaning/{fname}"
-        print(fpath)
         dirname = osp.dirname(fpath)
-        print(dirname)
         os.makedirs(dirname, exist_ok=True)
         with open(fpath, "w") as f:
             for d in diffs:

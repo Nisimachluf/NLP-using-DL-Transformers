@@ -245,3 +245,77 @@ def plot_length_distribution(dataset_dict, fname=None):
         plt.savefig(f'{fname}.jpg', format='jpg', dpi=300, bbox_inches='tight')
     
     plt.show()
+
+
+def plot_training_curves(trained_weights_dir='trained_weights', fname=None):
+    """
+    Plot training and validation loss curves for all models in trained_weights directory.
+    
+    Each subdirectory in trained_weights should contain model folders with training_log.csv files.
+    The function plots all models on the same axes with different colors, using solid lines for 
+    training loss and dashed lines for validation loss.
+    
+    Args:
+        trained_weights_dir: Path to directory containing trained model weights (default: 'trained_weights')
+        fname: Optional file path to save the figure (without extension, will be saved as .jpg)
+    """
+    # Find all training_log.csv files
+    training_logs = []
+    for root, dirs, files in os.walk(trained_weights_dir):
+        if 'training_log.csv' in files:
+            log_path = os.path.join(root, 'training_log.csv')
+            # Extract model name from path (e.g., 'google/electra-small-discriminator')
+            rel_path = os.path.relpath(root, trained_weights_dir)
+            model_name = rel_path.replace(os.sep, '/')
+            training_logs.append((model_name, log_path))
+    
+    if not training_logs:
+        print(f"No training_log.csv files found in {trained_weights_dir}")
+        return
+    
+    # Define colors and markers for different models
+    colors = plt.cm.tab10(np.linspace(0, 1, len(training_logs)))
+    markers = ['o', 's', '^', 'v', 'D', 'p', '*', 'h', '<', '>']
+    
+    # Create figure
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    # Plot each model
+    for idx, (model_name, log_path) in enumerate(training_logs):
+        # Read training log
+        df = pd.read_csv(log_path)
+        
+        # Extract epochs and losses
+        epochs = df['epoch'].values
+        train_loss = df['train_loss'].values
+        eval_loss = df['eval_loss'].values
+        
+        color = colors[idx]
+        marker = markers[idx % len(markers)]
+        
+        # Plot training loss (solid line with markers)
+        ax.plot(epochs, train_loss, color=color, linestyle='-', marker=marker,
+               label=f'{model_name} (train)', linewidth=2, markersize=8, markeredgewidth=1.5,
+               markeredgecolor='white')
+        
+        # Plot validation loss (dashed line with markers)
+        ax.plot(epochs, eval_loss, color=color, linestyle='--', marker=marker,
+               label=f'{model_name} (val)', linewidth=2, markersize=8, markeredgewidth=1.5,
+               markeredgecolor='white')
+    
+    ax.set_xlabel('Epoch', fontsize=12)
+    ax.set_ylabel('Loss', fontsize=12)
+    ax.set_title('Training and Validation Loss Curves', fontsize=14, fontweight='bold')
+    ax.legend(fontsize=9, loc='best')
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    if fname:
+        # Ensure the directory exists
+        directory = os.path.dirname(fname)
+        if directory and not os.path.exists(directory):
+            os.makedirs(directory, exist_ok=True)
+        plt.savefig(f'{fname}.jpg', format='jpg', dpi=300, bbox_inches='tight')
+    
+    plt.show()

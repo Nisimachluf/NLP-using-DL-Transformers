@@ -7,7 +7,7 @@ import numpy as np
 import os.path as osp
 from shutil import copyfile, rmtree
 from torch.nn import CrossEntropyLoss
-from datasets import load_dataset, DatasetDict, ClassLabel, 
+from datasets import load_dataset, DatasetDict, ClassLabel
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, TrainerCallback, Trainer, DataCollatorWithPadding, EarlyStoppingCallback, TrainingArguments
 
 from data_utils import preprocess
@@ -211,9 +211,11 @@ def predict_on_dataset(model_path, dataset, split='test', batch_size=32, device=
             - 'labels': list of true labels (if available)
             - 'metrics': dict with accuracy, recall, precision, f1 scores (if labels available)
             - 'total_time': total inference time in seconds
-            - 'time_per_sample': average time in seconds per sample
+            - 'time_per_sample_mean': mean time per sample in seconds
+            - 'time_per_sample_std': std deviation of time per sample in seconds
     """
     import time
+    from tqdm import tqdm
     
     # Extract model name from path for caching
     model_name = "-".join(model_path.split('/')[-1].split("-")[:2])
@@ -224,7 +226,7 @@ def predict_on_dataset(model_path, dataset, split='test', batch_size=32, device=
         with open(cache_file, 'r') as f:
             cache = json.load(f)
         if cache_key in cache and split in cache[cache_key]:
-            print(f"Loading cached results for {cache_key}")
+            print(f"Loading cached results for {cache_key} on {split} split")
             return cache[cache_key][split]
     else:
         cache = {}
@@ -233,9 +235,9 @@ def predict_on_dataset(model_path, dataset, split='test', batch_size=32, device=
     if device is None:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
-    # Load model and tokenizer using load_hf_classifier
+    # Load model and tokenizer
+    print(f"Loading model: {cache_key}")
     model, tokenizer = load_hf_classifier(model_path, n_classes=6, training=False)
-    
     model.to(device)
     
     # Get the dataset split
@@ -243,25 +245,29 @@ def predict_on_dataset(model_path, dataset, split='test', batch_size=32, device=
         data = dataset[split]
     else:
         data = dataset
+    data = data.map(clean_text)
     
     # Prepare for inference
     all_predictions = []
     all_probabilities = []
     all_labels = []
+    sample_times = []
     
     # Track inference time
     start_time = time.time()
     
-    # Process in batches
-    for i in range(0, len(data), batch_size):
+    # Process in batches with progress bar
+    num_batches = (len(data) + batch_size - 1) // batch_size
+    for i in tqdm(range(0, len(data), batch_size), total=num_batches, desc="Inference"):
         batch_end = min(i + batch_size, len(data))
         batch_texts = data['text'][i:batch_end]
+        batch_size_actual = batch_end - i
         
         # Tokenize batch with padding to longest in batch
         tokenized = tokenizer(
             batch_texts,
             truncation=True,
-            padding=True,  # Pad to longest in batch
+            padding=True,
             max_length=512,
             return_tensors='pt'
         )
@@ -269,9 +275,12 @@ def predict_on_dataset(model_path, dataset, split='test', batch_size=32, device=
         # Move inputs to device
         inputs = {k: v.to(device) for k, v in tokenized.items()}
         
-        # Get predictions
+        # Get predictions - time only the model inference
         with torch.no_grad():
+            batch_start_time = time.time()
             outputs = model(**inputs)
+            batch_time = time.time() - batch_start_time
+            
             logits = outputs.logits
             probs = torch.softmax(logits, dim=-1)
             preds = torch.argmax(logits, dim=-1)
@@ -282,15 +291,20 @@ def predict_on_dataset(model_path, dataset, split='test', batch_size=32, device=
         # Collect labels if available
         if 'label' in data.features:
             all_labels.extend(data['label'][i:batch_end])
+        
+        # Track time per sample in this batch
+        sample_times.extend([batch_time / batch_size_actual] * batch_size_actual)
     
-    # Calculate total time and time per sample
+    # Calculate total time and time per sample statistics
     total_time = time.time() - start_time
-    time_per_sample = total_time / len(data)
+    time_per_sample_mean = np.mean(sample_times)
+    time_per_sample_std = np.std(sample_times)
     
     result = {
         'predictions': all_predictions,
         'total_time': total_time,
-        'time_per_sample': time_per_sample
+        'time_per_sample_mean': time_per_sample_mean,
+        'time_per_sample_std': time_per_sample_std
     }
     
     if all_labels:
@@ -302,6 +316,7 @@ def predict_on_dataset(model_path, dataset, split='test', batch_size=32, device=
         result['metrics'] = metrics
     
     # Save to cache with compact format for lists
+    print(f"Saving results to {cache_file}")
     if cache_key not in cache:
         cache[cache_key] = {}
     cache[cache_key][split] = result
@@ -314,7 +329,6 @@ def predict_on_dataset(model_path, dataset, split='test', batch_size=32, device=
     
     # Replace multiline lists with single-line compact format
     import re
-    # Match predictions or labels arrays that span multiple lines
     content = re.sub(
         r'"(predictions|labels)":\s*\[\s*((?:\d+,?\s*)+)\]',
         lambda m: f'"{m.group(1)}": [{", ".join(m.group(2).replace(",", "").split())}]',
@@ -331,12 +345,13 @@ def predict_on_dataset(model_path, dataset, split='test', batch_size=32, device=
 class CSVLoggingCallback(TrainerCallback):
     def __init__(self, output_dir):
         self.filepath = os.path.join(output_dir, "training_log.csv")
+        print("Logging training results to:", self.filepath)
         self.initialized = False
-        self.fieldnames = ["epoch", "step", "train_loss", "eval_loss", "eval_accuracy", "eval_recall", "eval_precision", "eval_f1"]
+        self.fieldnames = ["epoch", "step", "loss", "eval_loss", "eval_accuracy", "eval_recall", "eval_precision", "eval_f1"]
         self.buffer = {}
     
     def is_full(self):
-        return all(key in self.buffer for key in self.fieldnames)
+        return all([key in self.buffer for key in self.fieldnames])
     
     def on_log(self, args, state, control, logs=None, **kwargs):
         if not logs:
@@ -346,7 +361,7 @@ class CSVLoggingCallback(TrainerCallback):
         logs = dict(logs)
         logs["step"] = state.global_step
         self.buffer.update(logs)
-        
+        print(self.buffer)
         if self.is_full():
             write_header = not os.path.exists(self.filepath)
             with open(self.filepath, "a", newline="") as f:
@@ -354,6 +369,7 @@ class CSVLoggingCallback(TrainerCallback):
                 if write_header:
                     writer.writeheader()
                 cleaned_buffer = {k: self.buffer[k] for k in self.fieldnames}
+                print("writing row:", cleaned_buffer)
                 writer.writerow(cleaned_buffer)
             self.buffer.clear()
             
@@ -466,3 +482,138 @@ def train(model_name, dataset, output_dir, learning_rate, batch_size, num_train_
             copyfile(osp.join(output_dir, log_fname), osp.join(trained_model_path, log_fname))
                     
     return trainer
+
+
+def plot_feature_comparison(pretrained_model_path, finetuned_model_path, dataset, 
+                            label_mapping_path='classes.json', fname=None, method='tsne'):
+    """
+    Extract features from pretrained and finetuned models, reduce dimensionality to 2D, 
+    and create scatter plots colored by label.
+    
+    Args:
+        pretrained_model_path: Path to the pretrained model
+        finetuned_model_path: Path to the finetuned model
+        dataset: HuggingFace Dataset with 'text' and 'label' fields
+        label_mapping_path: Path to JSON file containing label mappings (default: 'classes.json')
+        fname: Optional file path to save the figure (without extension, will be saved as .jpg)
+        method: Dimensionality reduction method - 'tsne', 'pca', or 'umap' (default: 'tsne')
+    """
+    import matplotlib.pyplot as plt
+    from sklearn.manifold import TSNE
+    from sklearn.decomposition import PCA
+    
+    # Load label mapping
+    idx2label, label2idx = load_label_mapping(label_mapping_path)
+    
+    # Load tokenizer and models
+    tokenizer = AutoTokenizer.from_pretrained(pretrained_model_path)
+    pretrained_model = AutoModelForSequenceClassification.from_pretrained(pretrained_model_path)
+    finetuned_model = AutoModelForSequenceClassification.from_pretrained(finetuned_model_path)
+    
+    # Set models to evaluation mode
+    pretrained_model.eval()
+    finetuned_model.eval()
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    pretrained_model.to(device)
+    finetuned_model.to(device)
+    
+    # Extract features for both models
+    def extract_features(model, texts):
+        features = []
+        with torch.no_grad():
+            for text in texts:
+                # Tokenize
+                inputs = tokenizer(text, return_tensors='pt', truncation=True, 
+                                 max_length=512, padding=True)
+                inputs = {k: v.to(device) for k, v in inputs.items()}
+                
+                # Get hidden states (remove classification head)
+                outputs = model(**inputs, output_hidden_states=True)
+                # Use [CLS] token representation from last hidden state
+                hidden_state = outputs.hidden_states[-1][:, 0, :].cpu().numpy()
+                features.append(hidden_state.squeeze())
+        
+        return np.array(features)
+    
+    print("Extracting features from pretrained model...")
+    pretrained_features = extract_features(pretrained_model, dataset['text'])
+    
+    print("Extracting features from finetuned model...")
+    finetuned_features = extract_features(finetuned_model, dataset['text'])
+    
+    # Apply dimensionality reduction
+    print(f"Applying {method.upper()} dimensionality reduction...")
+    if method.lower() == 'tsne':
+        reducer_pretrained = TSNE(n_components=2, random_state=42, perplexity=30)
+        reducer_finetuned = TSNE(n_components=2, random_state=42, perplexity=30)
+        pretrained_2d = reducer_pretrained.fit_transform(pretrained_features)
+        finetuned_2d = reducer_finetuned.fit_transform(finetuned_features)
+    elif method.lower() == 'pca':
+        reducer = PCA(n_components=2, random_state=42)
+        pretrained_2d = reducer.fit_transform(pretrained_features)
+        finetuned_2d = reducer.fit_transform(finetuned_features)
+    elif method.lower() == 'umap':
+        try:
+            from umap import UMAP
+            reducer_pretrained = UMAP(n_components=2, random_state=42)
+            reducer_finetuned = UMAP(n_components=2, random_state=42)
+            pretrained_2d = reducer_pretrained.fit_transform(pretrained_features)
+            finetuned_2d = reducer_finetuned.fit_transform(finetuned_features)
+        except ImportError:
+            print("UMAP not installed. Falling back to t-SNE.")
+            reducer_pretrained = TSNE(n_components=2, random_state=42, perplexity=30)
+            reducer_finetuned = TSNE(n_components=2, random_state=42, perplexity=30)
+            pretrained_2d = reducer_pretrained.fit_transform(pretrained_features)
+            finetuned_2d = reducer_finetuned.fit_transform(finetuned_features)
+    else:
+        raise ValueError(f"Unknown method: {method}. Choose from 'tsne', 'pca', or 'umap'.")
+    
+    # Get labels and label names
+    labels = dataset['label']
+    label_names = [idx2label[i] for i in sorted(idx2label.keys())]
+    
+    # Create color map
+    unique_labels = sorted(set(labels))
+    colors = plt.cm.tab10(np.linspace(0, 1, len(unique_labels)))
+    color_map = {label: colors[i] for i, label in enumerate(unique_labels)}
+    
+    # Create figure with two subplots
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
+    
+    # Plot pretrained model features
+    for label in unique_labels:
+        mask = np.array(labels) == label
+        ax1.scatter(pretrained_2d[mask, 0], pretrained_2d[mask, 1], 
+                   c=[color_map[label]], label=idx2label[label], 
+                   alpha=0.6, s=50, edgecolors='black', linewidth=0.5)
+    
+    ax1.set_title('Pretrained Model Features', fontsize=14, fontweight='bold')
+    ax1.set_xlabel(f'{method.upper()} Component 1', fontsize=12)
+    ax1.set_ylabel(f'{method.upper()} Component 2', fontsize=12)
+    ax1.legend(fontsize=10, loc='best')
+    ax1.grid(True, alpha=0.3)
+    
+    # Plot finetuned model features
+    for label in unique_labels:
+        mask = np.array(labels) == label
+        ax2.scatter(finetuned_2d[mask, 0], finetuned_2d[mask, 1], 
+                   c=[color_map[label]], label=idx2label[label], 
+                   alpha=0.6, s=50, edgecolors='black', linewidth=0.5)
+    
+    ax2.set_title('Finetuned Model Features', fontsize=14, fontweight='bold')
+    ax2.set_xlabel(f'{method.upper()} Component 1', fontsize=12)
+    ax2.set_ylabel(f'{method.upper()} Component 2', fontsize=12)
+    ax2.legend(fontsize=10, loc='best')
+    ax2.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    if fname:
+        # Ensure the directory exists
+        directory = os.path.dirname(fname)
+        if directory and not os.path.exists(directory):
+            os.makedirs(directory, exist_ok=True)
+        plt.savefig(f'{fname}.jpg', format='jpg', dpi=300, bbox_inches='tight')
+    
+    plt.show()

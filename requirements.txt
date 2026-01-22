@@ -14,3 +14,4 @@ contractions
 ekphrasis
 beautifulsoup4
 lxml
+umap-learn
