@@ -7,10 +7,11 @@ import numpy as np
 import os.path as osp
 from shutil import copyfile, rmtree
 from torch.nn import CrossEntropyLoss
+from huggingface_hub import HfApi, errors
 from datasets import load_dataset, DatasetDict, ClassLabel
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, TrainerCallback, Trainer, DataCollatorWithPadding, EarlyStoppingCallback, TrainingArguments
 
-from data_utils import preprocess
+from data_utils import preprocess, clean_text
 
 def load_csv_to_dataset(train_path, test_path, label_mapping_path='classes.json'):
     """
@@ -193,7 +194,7 @@ def create_model_stats_csv(trained_weights_dir='trained_weights', output_csv='mo
     print(f"Model statistics saved to {output_csv}")
 
 
-def predict_on_dataset(model_path, dataset, split='test', batch_size=32, device=None, cache_file='predictions_cache.json'):
+def predict_on_dataset(model_path, dataset, split='test', batch_size=32, device=None, cache_file='predictions.json'):
     """
     Load a model and make predictions on a dataset split.
     
@@ -203,7 +204,7 @@ def predict_on_dataset(model_path, dataset, split='test', batch_size=32, device=
         split: Name of the split to predict on (default: 'test')
         batch_size: Batch size for inference (default: 32)
         device: Device to use ('cuda' or 'cpu'). If None, auto-detects.
-        cache_file: Path to JSON file for caching results (default: 'predictions_cache.json')
+        cache_file: Path to JSON file for caching results (default: 'predictions.json')
     
     Returns:
         dict: Dictionary containing:
@@ -320,6 +321,9 @@ def predict_on_dataset(model_path, dataset, split='test', batch_size=32, device=
     if cache_key not in cache:
         cache[cache_key] = {}
     cache[cache_key][split] = result
+    cache_dir = osp.dirname(cache_file)
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
     with open(cache_file, 'w') as f:
         json.dump(cache, f, indent=2, separators=(',', ': '))
     
@@ -340,7 +344,6 @@ def predict_on_dataset(model_path, dataset, split='test', batch_size=32, device=
         f.write(content)
     
     return result
-
 
 class CSVLoggingCallback(TrainerCallback):
     def __init__(self, output_dir):
@@ -432,7 +435,7 @@ def train(model_name, dataset, output_dir, learning_rate, batch_size, num_train_
     training_args = TrainingArguments(
         output_dir=output_dir,
         learning_rate=learning_rate,
-        lr_scheduler_type=lr_scheduler_type,
+        lr_scheduler_type=lr_scheduler_type,        
         warmup_ratio=warmup_ratio,
         per_device_train_batch_size=batch_size,
         per_device_eval_batch_size=batch_size,
@@ -483,137 +486,18 @@ def train(model_name, dataset, output_dir, learning_rate, batch_size, num_train_
                     
     return trainer
 
-
-def plot_feature_comparison(pretrained_model_path, finetuned_model_path, dataset, 
-                            label_mapping_path='classes.json', fname=None, method='tsne'):
+def model_exists_on_hub(model_id):
     """
-    Extract features from pretrained and finetuned models, reduce dimensionality to 2D, 
-    and create scatter plots colored by label.
-    
-    Args:
-        pretrained_model_path: Path to the pretrained model
-        finetuned_model_path: Path to the finetuned model
-        dataset: HuggingFace Dataset with 'text' and 'label' fields
-        label_mapping_path: Path to JSON file containing label mappings (default: 'classes.json')
-        fname: Optional file path to save the figure (without extension, will be saved as .jpg)
-        method: Dimensionality reduction method - 'tsne', 'pca', or 'umap' (default: 'tsne')
+    Checks if a model with the given model_id exists on the Hugging Face Hub.
     """
-    import matplotlib.pyplot as plt
-    from sklearn.manifold import TSNE
-    from sklearn.decomposition import PCA
-    
-    # Load label mapping
-    idx2label, label2idx = load_label_mapping(label_mapping_path)
-    
-    # Load tokenizer and models
-    tokenizer = AutoTokenizer.from_pretrained(pretrained_model_path)
-    pretrained_model = AutoModelForSequenceClassification.from_pretrained(pretrained_model_path)
-    finetuned_model = AutoModelForSequenceClassification.from_pretrained(finetuned_model_path)
-    
-    # Set models to evaluation mode
-    pretrained_model.eval()
-    finetuned_model.eval()
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    pretrained_model.to(device)
-    finetuned_model.to(device)
-    
-    # Extract features for both models
-    def extract_features(model, texts):
-        features = []
-        with torch.no_grad():
-            for text in texts:
-                # Tokenize
-                inputs = tokenizer(text, return_tensors='pt', truncation=True, 
-                                 max_length=512, padding=True)
-                inputs = {k: v.to(device) for k, v in inputs.items()}
-                
-                # Get hidden states (remove classification head)
-                outputs = model(**inputs, output_hidden_states=True)
-                # Use [CLS] token representation from last hidden state
-                hidden_state = outputs.hidden_states[-1][:, 0, :].cpu().numpy()
-                features.append(hidden_state.squeeze())
-        
-        return np.array(features)
-    
-    print("Extracting features from pretrained model...")
-    pretrained_features = extract_features(pretrained_model, dataset['text'])
-    
-    print("Extracting features from finetuned model...")
-    finetuned_features = extract_features(finetuned_model, dataset['text'])
-    
-    # Apply dimensionality reduction
-    print(f"Applying {method.upper()} dimensionality reduction...")
-    if method.lower() == 'tsne':
-        reducer_pretrained = TSNE(n_components=2, random_state=42, perplexity=30)
-        reducer_finetuned = TSNE(n_components=2, random_state=42, perplexity=30)
-        pretrained_2d = reducer_pretrained.fit_transform(pretrained_features)
-        finetuned_2d = reducer_finetuned.fit_transform(finetuned_features)
-    elif method.lower() == 'pca':
-        reducer = PCA(n_components=2, random_state=42)
-        pretrained_2d = reducer.fit_transform(pretrained_features)
-        finetuned_2d = reducer.fit_transform(finetuned_features)
-    elif method.lower() == 'umap':
-        try:
-            from umap import UMAP
-            reducer_pretrained = UMAP(n_components=2, random_state=42)
-            reducer_finetuned = UMAP(n_components=2, random_state=42)
-            pretrained_2d = reducer_pretrained.fit_transform(pretrained_features)
-            finetuned_2d = reducer_finetuned.fit_transform(finetuned_features)
-        except ImportError:
-            print("UMAP not installed. Falling back to t-SNE.")
-            reducer_pretrained = TSNE(n_components=2, random_state=42, perplexity=30)
-            reducer_finetuned = TSNE(n_components=2, random_state=42, perplexity=30)
-            pretrained_2d = reducer_pretrained.fit_transform(pretrained_features)
-            finetuned_2d = reducer_finetuned.fit_transform(finetuned_features)
-    else:
-        raise ValueError(f"Unknown method: {method}. Choose from 'tsne', 'pca', or 'umap'.")
-    
-    # Get labels and label names
-    labels = dataset['label']
-    label_names = [idx2label[i] for i in sorted(idx2label.keys())]
-    
-    # Create color map
-    unique_labels = sorted(set(labels))
-    colors = plt.cm.tab10(np.linspace(0, 1, len(unique_labels)))
-    color_map = {label: colors[i] for i, label in enumerate(unique_labels)}
-    
-    # Create figure with two subplots
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
-    
-    # Plot pretrained model features
-    for label in unique_labels:
-        mask = np.array(labels) == label
-        ax1.scatter(pretrained_2d[mask, 0], pretrained_2d[mask, 1], 
-                   c=[color_map[label]], label=idx2label[label], 
-                   alpha=0.6, s=50, edgecolors='black', linewidth=0.5)
-    
-    ax1.set_title('Pretrained Model Features', fontsize=14, fontweight='bold')
-    ax1.set_xlabel(f'{method.upper()} Component 1', fontsize=12)
-    ax1.set_ylabel(f'{method.upper()} Component 2', fontsize=12)
-    ax1.legend(fontsize=10, loc='best')
-    ax1.grid(True, alpha=0.3)
-    
-    # Plot finetuned model features
-    for label in unique_labels:
-        mask = np.array(labels) == label
-        ax2.scatter(finetuned_2d[mask, 0], finetuned_2d[mask, 1], 
-                   c=[color_map[label]], label=idx2label[label], 
-                   alpha=0.6, s=50, edgecolors='black', linewidth=0.5)
-    
-    ax2.set_title('Finetuned Model Features', fontsize=14, fontweight='bold')
-    ax2.set_xlabel(f'{method.upper()} Component 1', fontsize=12)
-    ax2.set_ylabel(f'{method.upper()} Component 2', fontsize=12)
-    ax2.legend(fontsize=10, loc='best')
-    ax2.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    
-    if fname:
-        # Ensure the directory exists
-        directory = os.path.dirname(fname)
-        if directory and not os.path.exists(directory):
-            os.makedirs(directory, exist_ok=True)
-        plt.savefig(f'{fname}.jpg', format='jpg', dpi=300, bbox_inches='tight')
-    
-    plt.show()
+    api = HfApi()
+    try:
+        api.model_info(model_id)
+        return True
+    except errors.RepositoryNotFoundError:
+        return False
+    except Exception as e:
+        # Handle other potential errors (e.g., network issues, authentication errors)
+        print(type(e))
+        print(f"An error occurred: {e}")
+        return False

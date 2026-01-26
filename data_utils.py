@@ -51,17 +51,18 @@ def clean_html_metadata(text, window_size=5, threshold=0.4):
     # Consolidate common technical bigrams into single tokens before splitting
     # This allows us to treat multi-word patterns as single units
     text = re.sub(r'\ba\s+href\b', 'a_href', text, flags=re.IGNORECASE)
+    text = re.sub(r'\ba\s+rel\b', 'a_rel', text, flags=re.IGNORECASE)
     text = re.sub(r'\bn\s+href\b', 'n_href', text, flags=re.IGNORECASE)
     
     # Define technical/metadata words (potential noise when in technical context)
     technical_terms = {
         'html', 'css', 'xml', 'php', 'javascript', 'js',
-        'a_href', 'n_href', 'src', 'rel', 'alt', 'link', 'img', 'div', 'span', 'script',
-        'width', 'height', 'border', 'margin', 'padding', 'px', 'em',
-        'style', 'class', 'type', 'text', 'application', 'background', 'color', 'serif', 'br'
-        'font', 'size', 'family', 'annotation', 
+        'a_href', 'n_href', 'a_rel', 'src', 'rel', 'alt', 'link', 'img', 'div', 'span', 'script',
+        'width', 'height', 'border', 'margin', 'padding', 'px', 'em', 'data', 'medium', 'src', 'img', 'image', 'top', 'bottom'
+        'style', 'class', 'type', 'text', 'application', 'background', 'color', 'serif', 'br', 'adjust', 'auto',
+        'font', 'size', 'family', 'annotation', 'display', 'indline', 'new', 'roman',
         'http', 'https', 'www', 'url', 'uri',
-        'true', 'false', 'null',
+        'true', 'false', 'null', 'target',
         'stylesheet', 'templates', 'pub', 'message', 'board',
         'vol', 'en', 'del', 'fn',
         'atom', 'ltr', 'rtl', 'utf',
@@ -104,7 +105,7 @@ def clean_html_metadata(text, window_size=5, threshold=0.4):
     # Remove any remaining technical terms at the end of the text
     # BUT: Don't remove if it's just a single word (likely legitimate text)
     # EXCEPT: Always remove consolidated bigrams like a_href, n_href (these are always noise)
-    always_remove_terms = {'a_href', 'n_href'}
+    always_remove_terms = {'a_href', 'n_href', 'a_rel'}
     
     i = len(to_remove) - 1
     trailing_count = 0
@@ -458,50 +459,11 @@ def highlight_text_diff(string1, string2):
     
     return ' '.join(colored_string1_parts), ' '.join(colored_string2_parts)
 
-def count_text_differences(string1, string2):
-    """
-    Count the number of word-level differences between two strings.
-    
-    Args:
-        string1: Original string
-        string2: Modified string
-    
-    Returns:
-        dict: Dictionary with counts of:
-            - 'additions': Words added to string2
-            - 'deletions': Words deleted from string1
-            - 'replacements': Words replaced between strings
-            - 'total_changes': Sum of all changes
-    """
-    import difflib
-    
-    # Split strings into words
-    words1 = string1.split()
-    words2 = string2.split()
-    
-    # Use difflib to get the differences
-    diff = difflib.SequenceMatcher(None, words1, words2)
-    
-    additions = 0
-    deletions = 0
-    replacements = 0
-    
-    for tag, i1, i2, j1, j2 in diff.get_opcodes():
-        if tag == 'delete':
-            deletions += (i2 - i1)
-        elif tag == 'insert':
-            additions += (j2 - j1)
-        elif tag == 'replace':
-            # Count as replacements (could also count as deletions + additions)
-            replacements += max(i2 - i1, j2 - j1)
-    pos = int(len(string1) < 221  and len(string2) < 221)
-    return (additions + deletions + replacements)*pos
-    
+   
 def show_diff(dataset, n_cases=5, fname=None):
     df = dataset["train"].to_pandas()
     df = df[df["is_cleaned"]]
-    df["l"] = df.apply(lambda x: count_text_differences(x["text"], x["cleaned"]), axis=1)
-    df = df.sort_values("l", ascending=False)
+    df = df.sample(n=n_cases)
     diffs = []
     for idx, (t1, t2) in enumerate(zip(df.text.tolist(), df.cleaned.tolist()), 1):
         s1, s2 = highlight_text_diff(t1, t2)
@@ -519,3 +481,22 @@ def show_diff(dataset, n_cases=5, fname=None):
             for d in diffs:
                 f.write("\n".join(d)+"\n")
     return
+
+def show_duplicates(dataset):
+    df = dataset["train"].to_pandas()
+    duplicates = df[df.duplicated(subset=["text"], keep=False)]
+
+    idx2label, label2idx = load_label_mapping()
+    titles = ["Labels", "Tweet"]
+    max_tweet_len = 80
+    max_label_len = 15
+    print(f"{titles[0]:^{max_label_len}} |{titles[1]:^{max_tweet_len}}")
+    print("-"*(max_label_len+max_tweet_len+3))
+    ctr = 0
+    for t, tdf in duplicates.groupby("text"):
+        if True: #len(t) <= max_tweet_len:
+            labels = "({})".format('/'.join([idx2label[idx] for idx in tdf.label.tolist()]))
+            print(f"{labels:<{max_label_len}} | {t}")
+            ctr += 1
+            if ctr == 5:
+                break

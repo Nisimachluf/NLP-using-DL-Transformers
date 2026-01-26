@@ -50,7 +50,7 @@ def load_hparams(model_name):
     hparams_file = f"{hparams_dir}/{model_name}.json"
     if not osp.exists(hparams_file):
         return None
-    print(f"Loading best hyperparameters for {model_name} from {hparams_file}")
+    print(f"Found tuned hyperparameters for {model_name} at {hparams_file}")
     with open(hparams_file, "r") as f:
         hparams = json.load(f)
     return hparams

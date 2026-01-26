@@ -1,10 +1,14 @@
 import os
+import json
+import torch
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
 import pandas as pd
-from utils import load_label_mapping
+import seaborn as sns
+import matplotlib.pyplot as plt
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
+from data_utils import clean_text
+from utils import load_label_mapping
 
 def plot_class_distribution(dataset_dict, label_mapping_path='classes.json', fname=None):
     """
@@ -139,7 +143,7 @@ def plot_confusion_matrices(predictions_cache_path='predictions_cache.json', lab
         directory = os.path.dirname(selected_model_fpath)
         if directory and not os.path.exists(directory):
             os.makedirs(directory, exist_ok=True)
-        plt.savefig(f'{selected_model_fpath}.jpg', format='jpg', dpi=300, bbox_inches='tight', pad_inches=0)
+        plt.savefig(f'{selected_model_fpath}.jpg', format='jpg', dpi=200, bbox_inches='tight', pad_inches=0)
         plt.close(fig_single)
     
     # Create subplots for all models - arrange in grid (2 columns)
@@ -187,7 +191,7 @@ def plot_confusion_matrices(predictions_cache_path='predictions_cache.json', lab
         directory = os.path.dirname(fname)
         if directory and not os.path.exists(directory):
             os.makedirs(directory, exist_ok=True)
-        plt.savefig(f'{fname}.jpg', format='jpg', dpi=300, bbox_inches='tight')
+        plt.savefig(f'{fname}.jpg', format='jpg', dpi=200, bbox_inches='tight')
     
     plt.show()
 
@@ -317,5 +321,306 @@ def plot_training_curves(trained_weights_dir='trained_weights', fname=None):
         if directory and not os.path.exists(directory):
             os.makedirs(directory, exist_ok=True)
         plt.savefig(f'{fname}.jpg', format='jpg', dpi=300, bbox_inches='tight')
+    
+    plt.show()
+    
+def plot_feature_comparison(pretrained_model_paths, finetuned_model_paths, dataset, 
+                            label_mapping_path='classes.json', fname=None, 
+                            selected_model=None, selected_model_fpath=None,
+                            method='tsne', features_cache_dir='features',
+                            metrics_cache_file='feature_separability_metrics.json'):
+    """
+    Extract features from pretrained and finetuned model pairs, reduce dimensionality to 2D, 
+    and create scatter plots colored by label.
+    
+    Args:
+        pretrained_model_paths: List of paths to pretrained models or dict {model_name: model_path}
+        finetuned_model_paths: List of paths to finetuned models or dict {model_name: model_path}
+        dataset: HuggingFace Dataset with 'text' and 'label' fields
+        label_mapping_path: Path to JSON file containing label mappings (default: 'classes.json')
+        fname: Optional file path to save the entire figure (without extension, will be saved as .jpg)
+        selected_model: Optional model name to save separately (should be in one of the model lists)
+        selected_model_fpath: File path to save the selected model's plot separately (without extension)
+        method: Dimensionality reduction method - 'tsne', 'pca', or 'umap' (default: 'tsne')
+        features_cache_dir: Directory to cache extracted features (default: 'features')
+        metrics_cache_file: JSON file to cache all separability metrics (default: 'feature_separability_metrics.json')
+    """
+    import matplotlib.pyplot as plt
+    from sklearn.manifold import TSNE
+    from sklearn.decomposition import PCA
+    from sklearn.metrics import adjusted_rand_score, adjusted_mutual_info_score
+    from sklearn.cluster import KMeans
+    from tqdm import tqdm
+    
+    def extract_model_name(path):
+        """Extract model name from path like 'google/electra-small-discriminator' -> 'electra-small'"""
+        # Get the last part of the path
+        model_part = path.rstrip('/').split('/')[-1]
+        # Extract first two parts separated by '-'
+        parts = model_part.split('-')
+        if len(parts) >= 2:
+            return '-'.join(parts[:2])
+        return model_part
+    
+    # Convert to dicts if they're lists
+    if isinstance(pretrained_model_paths, list):
+        pretrained_dict = {extract_model_name(path): path for path in pretrained_model_paths}
+    else:
+        pretrained_dict = pretrained_model_paths
+    
+    if isinstance(finetuned_model_paths, list):
+        finetuned_dict = {extract_model_name(path): path for path in finetuned_model_paths}
+    else:
+        finetuned_dict = finetuned_model_paths
+    
+    # Ensure same number of models
+    if len(pretrained_dict) != len(finetuned_dict):
+        raise ValueError("Number of pretrained and finetuned models must match")
+    
+    # Load label mapping
+    idx2label, label2idx = load_label_mapping(label_mapping_path)
+    
+    # Clean dataset text
+    dataset = dataset.map(clean_text)
+    
+    labels = dataset['label']
+    unique_labels = sorted(set(labels))
+    
+    # Create color map
+    colors = plt.cm.tab10(np.linspace(0, 1, len(unique_labels)))
+    color_map = {label: colors[i] for i, label in enumerate(unique_labels)}
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Load metrics cache
+    if os.path.exists(metrics_cache_file):
+        with open(metrics_cache_file, 'r') as f:
+            all_metrics = json.load(f)
+    else:
+        all_metrics = {}
+    
+    def get_cache_path(model_name, model_type):
+        """Generate cache file path for features"""
+        os.makedirs(features_cache_dir, exist_ok=True)
+        safe_name = model_name.replace('/', '_')
+        return os.path.join(features_cache_dir, f"{safe_name}_{model_type}_{method}.npy")
+    
+    def save_metrics_to_cache(model_name, model_type, metrics):
+        """Save metrics to the global metrics cache file"""
+        # Create hierarchy: model-name >> method >> metrics
+        model_key = f"{model_name}_{model_type}"
+        if model_key not in all_metrics:
+            all_metrics[model_key] = {}
+        all_metrics[model_key][method] = metrics
+        
+        # Save to file
+        with open(metrics_cache_file, 'w') as f:
+            json.dump(all_metrics, f, indent=2)
+    
+    def get_metrics_from_cache(model_name, model_type):
+        """Get metrics from the global metrics cache file"""
+        model_key = f"{model_name}_{model_type}"
+        if model_key in all_metrics and method in all_metrics[model_key]:
+            return all_metrics[model_key][method]
+        return None
+    
+    def calculate_separability_metrics(features_2d, labels_array):
+        """Calculate separability metrics for the reduced features using ground truth labels"""
+        # Perform KMeans clustering with the same number of clusters as unique labels
+        n_clusters = len(np.unique(labels_array))
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        cluster_labels = kmeans.fit_predict(features_2d)
+        
+        # Calculate ARI and AMI comparing clusters to ground truth
+        metrics = {
+            'adjusted_rand_index': float(adjusted_rand_score(labels_array, cluster_labels)),
+            'adjusted_mutual_info': float(adjusted_mutual_info_score(labels_array, cluster_labels))
+        }
+        return metrics
+    
+    def extract_and_reduce_features(model_path, model_name, model_type="finetuned"):
+        """Extract features and apply dimensionality reduction with caching"""
+        cache_path = get_cache_path(model_name, model_type)
+        
+        # Check cache
+        if os.path.exists(cache_path):
+            print(f"Loading cached {method.upper()} features for {model_name} ({model_type})")
+            features_2d = np.load(cache_path)
+            
+            # Check if metrics are cached
+            metrics = get_metrics_from_cache(model_name, model_type)
+            if metrics:
+                print(f"Loading cached metrics for {model_name} ({model_type})")
+            else:
+                # Calculate and cache metrics
+                print(f"Calculating separability metrics for {model_name} ({model_type})")
+                metrics = calculate_separability_metrics(features_2d, np.array(labels))
+                save_metrics_to_cache(model_name, model_type, metrics)
+            
+            return features_2d, metrics
+        
+        print(f"Extracting features for {model_name} ({model_type})...")
+        
+        # Load model and tokenizer
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        model = AutoModelForSequenceClassification.from_pretrained(model_path)
+        model.eval()
+        model.to(device)
+        
+        # Extract features
+        features = []
+        with torch.no_grad():
+            for text in tqdm(dataset['text'], desc=f"Extracting {model_name}"):
+                inputs = tokenizer(text, return_tensors='pt', truncation=True, 
+                                 max_length=512, padding=True)
+                inputs = {k: v.to(device) for k, v in inputs.items()}
+                
+                outputs = model(**inputs, output_hidden_states=True)
+                hidden_state = outputs.hidden_states[-1][:, 0, :].cpu().numpy()
+                features.append(hidden_state.squeeze())
+        
+        features = np.array(features)
+        
+        # Apply dimensionality reduction
+        print(f"Applying {method.upper()} reduction for {model_name}...")
+        if method.lower() == 'tsne':
+            reducer = TSNE(n_components=2, random_state=42, perplexity=30)
+            features_2d = reducer.fit_transform(features)
+        elif method.lower() == 'pca':
+            reducer = PCA(n_components=2, random_state=42)
+            features_2d = reducer.fit_transform(features)
+        elif method.lower() == 'umap':
+            try:
+                from umap import UMAP
+                reducer = UMAP(n_components=2, random_state=42)
+                features_2d = reducer.fit_transform(features)
+            except ImportError:
+                print("UMAP not installed. Falling back to t-SNE.")
+                reducer = TSNE(n_components=2, random_state=42, perplexity=30)
+                features_2d = reducer.fit_transform(features)
+        else:
+            raise ValueError(f"Unknown method: {method}. Choose from 'tsne', 'pca', or 'umap'.")
+        
+        # Cache the results
+        np.save(cache_path, features_2d)
+        print(f"Cached features to {cache_path}")
+        
+        # Calculate and cache separability metrics
+        print(f"Calculating separability metrics for {model_name} ({model_type})")
+        metrics = calculate_separability_metrics(features_2d, np.array(labels))
+        save_metrics_to_cache(model_name, model_type, metrics)
+        print(f"Cached metrics to {metrics_cache_file}")
+        
+        return features_2d, metrics
+    
+    def plot_scatter(ax, features_2d, title, metrics=None):
+        """Plot scatter plot on given axes"""
+        for label in unique_labels:
+            mask = np.array(labels) == label
+            ax.scatter(features_2d[mask, 0], features_2d[mask, 1], 
+                      c=[color_map[label]], label=idx2label[label], 
+                      alpha=0.6, s=25, edgecolors='black', linewidth=0.5)
+        
+        ax.set_title(title, fontsize=12, fontweight='bold')
+        ax.set_xlabel(f'{method.upper()} Component 1', fontsize=8)
+        ax.set_ylabel(f'{method.upper()} Component 2', fontsize=8)
+        ax.legend(fontsize=6, loc='lower right')
+        ax.grid(True, alpha=0.3)
+        
+        # Add metrics text box if provided
+        if metrics:
+            metrics_text = (
+                f"ARI: {metrics['adjusted_rand_index']:.3f}\n"
+                f"AMI: {metrics['adjusted_mutual_info']:.3f}"
+            )
+            ax.text(0.02, 0.98, metrics_text, transform=ax.transAxes,
+                   fontsize=8, verticalalignment='top',
+                   bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    # Extract features for all model pairs
+    model_pairs = []
+    selected_pair = None
+    
+    pretrained_list = list(pretrained_dict.items())
+    finetuned_list = list(finetuned_dict.items())
+    
+    # Find selected model if specified
+    selected_model_name = None
+    if selected_model:
+        selected_model_name = extract_model_name(selected_model)
+    
+    for (pre_name, pre_path), (fine_name, fine_path) in zip(pretrained_list, finetuned_list):
+        # Extract features
+        pre_features, pre_metrics = extract_and_reduce_features(pre_path, pre_name, "pretrained")
+        fine_features, fine_metrics = extract_and_reduce_features(fine_path, fine_name, "finetuned")
+        
+        model_pairs.append({
+            'pretrained_name': pre_name,
+            'finetuned_name': fine_name,
+            'pretrained_features': pre_features,
+            'finetuned_features': fine_features,
+            'pretrained_metrics': pre_metrics,
+            'finetuned_metrics': fine_metrics
+        })
+        
+        # Check if this is the selected model pair
+        if selected_model_name and (selected_model_name == pre_name or selected_model_name == fine_name):
+            selected_pair = model_pairs[-1]
+    
+    # Print separability metrics summary
+    print("\n=== Separability Metrics Summary ===")
+    for pair in model_pairs:
+        print(f"\nModel: {pair['pretrained_name']}")
+        print(f"  Pretrained:")
+        print(f"    Adjusted Rand Index: {pair['pretrained_metrics']['adjusted_rand_index']:.4f}")
+        print(f"    Adjusted Mutual Info: {pair['pretrained_metrics']['adjusted_mutual_info']:.4f}")
+        print(f"  Finetuned:")
+        print(f"    Adjusted Rand Index: {pair['finetuned_metrics']['adjusted_rand_index']:.4f}")
+        print(f"    Adjusted Mutual Info: {pair['finetuned_metrics']['adjusted_mutual_info']:.4f}")
+    
+    # If selected_model is specified and found, save it separately
+    if selected_model and selected_model_fpath and selected_pair:
+        fig_single, (ax1, ax2) = plt.subplots(1, 2, figsize=(9, 4))
+        
+        plot_scatter(ax1, selected_pair['pretrained_features'], selected_pair['pretrained_name'], 
+                    selected_pair['pretrained_metrics'])
+        plot_scatter(ax2, selected_pair['finetuned_features'], selected_pair['finetuned_name'],
+                    selected_pair['finetuned_metrics'])
+        
+        plt.tight_layout()
+        
+        # Save selected model plot
+        directory = os.path.dirname(selected_model_fpath)
+        if directory and not os.path.exists(directory):
+            os.makedirs(directory, exist_ok=True)
+        plt.savefig(f'{selected_model_fpath}.jpg', format='jpg', dpi=200, bbox_inches='tight')
+        plt.close(fig_single)
+    
+    # Create grid plot for all model pairs
+    n_pairs = len(model_pairs)
+    n_cols = 2
+    n_rows = n_pairs
+    
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(9, 4 * n_rows))
+    
+    # Flatten axes array if needed
+    if n_rows == 1:
+        axes = axes.reshape(1, -1)
+    
+    # Plot all pairs
+    for idx, pair in enumerate(model_pairs):
+        plot_scatter(axes[idx, 0], pair['pretrained_features'], pair['pretrained_name'],
+                    pair['pretrained_metrics'])
+        plot_scatter(axes[idx, 1], pair['finetuned_features'], pair['finetuned_name'],
+                    pair['finetuned_metrics'])
+    
+    plt.tight_layout()
+    
+    if fname:
+        # Ensure the directory exists
+        directory = os.path.dirname(fname)
+        if directory and not os.path.exists(directory):
+            os.makedirs(directory, exist_ok=True)
+        plt.savefig(f'{fname}.jpg', format='jpg', dpi=200, bbox_inches='tight')
     
     plt.show()
