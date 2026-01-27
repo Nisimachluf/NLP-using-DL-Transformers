@@ -4,6 +4,7 @@ import numpy as np
 import contractions
 import os.path as osp
 from bs4 import BeautifulSoup
+import json
 from datasets import DatasetDict, ClassLabel, Dataset
 
 def clean_html_metadata(text, window_size=5, threshold=0.4):
@@ -481,6 +482,29 @@ def show_diff(dataset, n_cases=5, fname=None):
             for d in diffs:
                 f.write("\n".join(d)+"\n")
     return
+
+def load_label_mapping(json_path='classes.json'):
+    """
+    Load label mapping from a JSON file.
+    
+    Args:
+        json_path: Path to the JSON file containing label mappings
+    
+    Returns:
+        tuple: (idx2label, label2idx) where:
+            - idx2label: Dictionary mapping label indices (int) to label names (str)
+            - label2idx: Dictionary mapping label names (str) to label indices (int)
+    """
+    with open(json_path, 'r') as f:
+        idx2label_str = json.load(f)
+    
+    # Convert string keys to integers for idx2label
+    idx2label = {int(k): v for k, v in idx2label_str.items()}
+    
+    # Create reverse mapping
+    label2idx = {v: int(k) for k, v in idx2label_str.items()}
+    
+    return idx2label, label2idx
 
 def show_duplicates(dataset):
     df = dataset["train"].to_pandas()
