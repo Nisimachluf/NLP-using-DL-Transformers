@@ -1,17 +1,25 @@
 import os
 import csv
 import json
+from xml.parsers.expat import model
 import torch
 import evaluate
 import numpy as np 
 import os.path as osp
+from sklearn.metrics import f1_score
 from shutil import copyfile, rmtree
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
 from torch.nn import CrossEntropyLoss
-from huggingface_hub import HfApi, errors
 from datasets import load_dataset, DatasetDict, ClassLabel
-from transformers import AutoModelForSequenceClassification, AutoTokenizer, TrainerCallback, Trainer, DataCollatorWithPadding, EarlyStoppingCallback, TrainingArguments
-
-from data_utils import preprocess, clean_text
+from transformers import AutoModelForSequenceClassification, AutoTokenizer, TrainerCallback, Trainer, DataCollatorWithPadding, EarlyStoppingCallback, TrainingArguments, get_linear_schedule_with_warmup
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+from data_utils import preprocess
+from torch.optim import AdamW
+from huggingface_hub import HfApi, errors
+from transformers import ElectraConfig, ElectraForSequenceClassification 
+import copy
+from data_utils import preprocess, clean_text, load_label_mapping
 
 def load_csv_to_dataset(train_path, test_path, label_mapping_path='classes.json'):
     """
@@ -44,31 +52,6 @@ def load_csv_to_dataset(train_path, test_path, label_mapping_path='classes.json'
     dataset = dataset.cast_column('label', ClassLabel(names=label_names))
     
     return dataset
-
-
-def load_label_mapping(json_path='classes.json'):
-    """
-    Load label mapping from a JSON file.
-    
-    Args:
-        json_path: Path to the JSON file containing label mappings
-    
-    Returns:
-        tuple: (idx2label, label2idx) where:
-            - idx2label: Dictionary mapping label indices (int) to label names (str)
-            - label2idx: Dictionary mapping label names (str) to label indices (int)
-    """
-    with open(json_path, 'r') as f:
-        idx2label_str = json.load(f)
-    
-    # Convert string keys to integers for idx2label
-    idx2label = {int(k): v for k, v in idx2label_str.items()}
-    
-    # Create reverse mapping
-    label2idx = {v: int(k) for k, v in idx2label_str.items()}
-    
-    return idx2label, label2idx
-
 
 def count_parameters(model, verbose=False):
     """
@@ -501,3 +484,280 @@ def model_exists_on_hub(model_id):
         print(type(e))
         print(f"An error occurred: {e}")
         return False
+    
+def initialize_student(teacher, mode="pruning", num_layers=6):
+    """
+    Initializes a student model based on the teacher.
+    
+    Args:
+        teacher: The trained teacher model.
+        mode: "pruning" (extract from teacher) or "st" (standard distillation from base).
+        num_layers: Number of encoder layers for the student.
+    """
+    num_labels = teacher.config.num_labels
+    
+    # If pruning, we use teacher's specific config; if ST, we use the base model path
+    base_path = teacher.config.name_or_path if mode == "pruning" else "google/electra-base-discriminator"
+    
+    student_config = ElectraConfig.from_pretrained(
+        base_path,
+        num_hidden_layers=num_layers,
+        num_labels=num_labels,
+    )
+
+    student = ElectraForSequenceClassification(student_config)
+    
+    if mode == "st":
+        print("Initializing Student from google/electra-base-discriminator (ST mode)...")
+        source_model = ElectraForSequenceClassification.from_pretrained("google/electra-base-discriminator")
+    else:
+        print("Initializing Student by pruning the provided Teacher...")
+        source_model = teacher
+    student.electra.embeddings.load_state_dict(source_model.electra.embeddings.state_dict())
+
+    # 5. Transfer Layer Weights (Skip-layer selection)
+    pretrained_indices = [1, 3, 5, 7, 9, 11] 
+    for student_idx, source_idx in enumerate(pretrained_indices):
+        student.electra.encoder.layer[student_idx].load_state_dict(
+            source_model.electra.encoder.layer[source_idx].state_dict()
+        )
+        
+    if mode == "pruning":
+        student.classifier.load_state_dict(source_model.classifier.state_dict())
+    else:
+        print("Classifier initialized randomly for ST mode.")
+
+    return student
+
+class CompressionTrainer:
+    def __init__(self, loss_name, teacher, student, dataset, data_collator, tokenizer, weights, path="."):
+        self.teacher = teacher
+        self.student = student
+        self.data_collator = data_collator
+        self.train_dataset = dataset['train']
+        self.train_dataset.set_format(type='torch')
+        self.val_dataset = dataset['validation']
+        self.val_dataset.set_format(type='torch')
+        self.tokenizer = tokenizer
+        self.loss_name = loss_name
+        self.path = path
+        LOSS_REGISTRY = {
+            "ce": CompressionTrainer.pruning_loss,
+            "kd": CompressionTrainer.student_teacher_loss,
+            "hybrid": CompressionTrainer.hybrid_loss
+        }
+        self.chosen_loss = LOSS_REGISTRY[loss_name].__get__(self)
+        self.weights = torch.from_numpy(weights)
+
+
+    def inialize_training(self):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.patience = 3 
+        self.counter = 0 
+        self.early_stop = False
+        self.best_acc = 0.0
+        self.num_epochs = 10
+        self.batch_size = 32
+        self.temperature = 2.0
+        self.lr = 2e-5
+        self.weight_decay=0.01
+        self.warmup_steps=0
+        self.alpha = 0.5  # weight for distillation loss
+        self.teacher.to(self.device)
+        self.student.to(self.device)
+        self.train_dataloader = DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, collate_fn=self.data_collator)
+        self.val_dataloader = DataLoader(self.val_dataset, batch_size=self.batch_size, collate_fn=self.data_collator)
+        for p in self.teacher.parameters():
+            p.requires_grad = False
+        self.teacher.eval()
+
+    def count_parameters(self, teacher):
+        print(sum(p.numel() for p in teacher.parameters()))
+
+    def pruning_loss(self, student_logits, teacher_logits, labels):
+        loss = F.cross_entropy(student_logits, labels, weight=self.weights.to(self.device))
+        return loss
+    
+    def student_teacher_loss(self, student_logits, teacher_logits, labels):
+        # Soft loss (teacher guidance)
+        soft_student = F.log_softmax(student_logits / self.temperature, dim=-1)
+        soft_teacher = F.softmax(teacher_logits / self.temperature, dim=-1)
+        soft_loss = F.kl_div(soft_student, soft_teacher, reduction="batchmean") * (self.temperature ** 2)
+        return soft_loss
+    
+    def hybrid_loss(self, student_logits, teacher_logits, labels):
+        hard_loss = self.pruning_loss(student_logits, teacher_logits, labels)
+        soft_loss = self.student_teacher_loss(student_logits, teacher_logits, labels)
+        total_loss = self.alpha * hard_loss + (1 - self.alpha) * soft_loss
+        return total_loss
+
+    
+    def train_model(self):
+        no_decay = ["bias", "LayerNorm.weight"]
+        optimizer_grouped_parameters = [
+            {
+                "params": [p for n, p in self.student.named_parameters() if not any(nd in n for nd in no_decay)],
+                "weight_decay": self.weight_decay,
+            },
+            {
+                "params": [p for n, p in self.student.named_parameters() if any(nd in n for nd in no_decay)],
+                "weight_decay": 0.0,
+            },
+        ]
+        optimizer = AdamW(optimizer_grouped_parameters, lr=self.lr)
+
+        # 2. Setup Scheduler
+        num_training_steps = len(self.train_dataloader) * self.num_epochs
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer, 
+            num_warmup_steps=self.warmup_steps, 
+            num_training_steps=num_training_steps
+        )
+
+        self.student.train()
+        for epoch in range(self.num_epochs):
+            if self.early_stop:
+                print("Early stopping triggered. Training finished.")
+                break
+            total_loss = 0.0
+            for batch in self.train_dataloader:
+                optimizer.zero_grad()
+                # Move batch to device
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+                token_type_ids = batch["token_type_ids"].to(self.device)
+                labels = batch["labels"].to(self.device)
+
+
+                # Teacher forward (no grad)
+                with torch.no_grad():
+                    if self.loss_name != "ce":
+                        teacher_logits = self.teacher(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            token_type_ids=token_type_ids
+                        ).logits
+                    else:
+                        teacher_logits = None
+
+                # Student forward
+                student_logits =self.student(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    token_type_ids=token_type_ids
+                ).logits
+
+                # Distillation loss
+                loss = self.chosen_loss(student_logits, teacher_logits, labels)
+
+                loss.backward()
+                optimizer.step()
+                scheduler.step()
+                total_loss += loss.item()
+
+            avg_loss = total_loss / len(self.train_dataloader)
+            # print(f"Epoch {epoch+1}/{self.num_epochs} | Train Loss: {avg_loss:.4f}")
+            self.validate_model(self.val_dataloader, epoch)
+
+    def validate_model(self, val_dataloader, epoch):
+        self.student.eval()
+        all_preds, all_labels = [], []
+
+        with torch.no_grad():
+            for batch in val_dataloader:
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+                token_type_ids = batch["token_type_ids"].to(self.device)
+                labels = batch["labels"].to(self.device)
+
+                outputs = self.student(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    token_type_ids=token_type_ids
+                )
+                preds = torch.argmax(outputs.logits, dim=-1)
+
+                all_preds.extend(preds.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
+
+        acc = accuracy_score(all_labels, all_preds)
+        # acc = accuracy_score(all_labels, all_preds)
+        f1_macro = f1_score(all_labels, all_preds, average="macro")
+        f1_weighted = f1_score(all_labels, all_preds, average="weighted")
+
+        print(f"Validation Accuracy: {acc:.4f}")
+        # print(f"Validation Accuracy: {acc:.4f}")
+        self.save_best_model(epoch, acc)
+
+    def save_best_model(self, epoch, acc):
+        if acc > self.best_acc:
+            self.counter = 0
+            self.best_acc = acc
+            if not os.path.exists(self.path):
+                os.makedirs(self.path)
+            self.student.save_pretrained(self.path)
+            self.tokenizer.save_pretrained(self.path)
+        else:
+            self.counter += 1
+            print(f"EarlyStopping counter: {self.counter} out of {self.patience}")
+            if self.counter >= self.patience:
+                self.early_stop = True
+
+def iterative_with_trainer(teacher_model, processed_dataset, tokenizer, layers_to_drop, loss, data_collator, save_dir="students_iterative"): 
+    """
+    Iterative distillation using copy.deepcopy + layer popping with your Trainer class.
+
+    teacher_model: HuggingFace teacher model (frozen)
+    train_dataloader, val_dataloader: HuggingFace DataLoaders`
+    tokenizer: tokenizer for saving/loading
+    layers_to_drop: list of layers to drop in order (top layers first)
+    num_epochs_per_student: number of epochs for each student
+    save_dir: folder to save each student model
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    current_teacher = teacher_model
+
+    for step, layer_idx in enumerate(layers_to_drop):
+        print(f"\n--- Iteration {step}/{len(layers_to_drop)} ---")
+        print(f"Dropping layer {layer_idx} for this student")
+
+        # student imitate teacher
+        student = copy.deepcopy(current_teacher)
+
+        # Drop the specified layer
+        student.electra.encoder.layer.pop(layer_idx)
+        student.config.num_hidden_layers -= 1
+        for param in student.parameters():
+            param.requires_grad = True
+
+        print("Teacher params:", count_parameters(current_teacher)[0])
+        print("Student params:", count_parameters(student)[0])
+
+        if step == len(layers_to_drop) - 1:
+            step_save_path = os.path.join(save_dir, loss)
+        else:
+            step_save_path = os.path.join(save_dir, f"not_final_step")
+
+        trainer = CompressionTrainer(
+            loss_name=loss,
+            teacher=current_teacher, # Use the model from last step
+            student=student,         # new student
+            dataset=processed_dataset,
+            data_collator=data_collator,
+            tokenizer=tokenizer,
+            weights=calc_class_weights(processed_dataset['train']),
+            path=step_save_path
+            )
+    
+        trainer.inialize_training()
+
+        trainer.early_stop = False 
+        
+        trainer.train_model()
+        
+        current_teacher = copy.deepcopy(trainer.student).cpu().eval()
+
+
+        print("\nIterative distillation finished!")
+        print(f"Final student is saved in: {step_save_path}")
+    return step_save_path  # folder of the final student
