@@ -133,6 +133,32 @@ HF_TOKEN=your_huggingface_token_here
 
 ## Usage
 
+### Running Inference
+
+To run inference on new data using a trained model, use the `run_inference` function:
+
+```python
+from utils import run_inference
+
+# Run inference on a CSV file
+predictions = run_inference(
+    weights='trained_weights/google/electra-large-discriminator',
+    csv='path/to/your/data.csv'
+)
+```
+
+The function will:
+- Load and clean the text data automatically
+- Make predictions using the specified model
+- Print evaluation metrics (if labels are provided in the CSV)
+- Return a list of predicted class indices
+
+**Note:** For best results, use **ELECTRA-large** (`trained_weights/google/electra-large-discriminator`), which achieved the highest F1 score in our evaluation.
+
+Your CSV file should contain at minimum a `text` column. If a `label` column is included, the function will compute and display accuracy, precision, recall, and F1 metrics.
+
+### Running the Complete Pipeline
+
 Open and run `ProjectB.ipynb` to execute the complete pipeline:
 1. Load and clean the tweet dataset
 2. Train transformer models with optimized hyperparameters
