@@ -205,8 +205,8 @@ def predict_on_dataset(model_path, dataset, split='test', batch_size=32, device=
     model_name = "-".join(model_path.split('/')[-1].split("-")[:2])
     cache_key = f"{model_name}"
     
-    # Check if results are already cached
-    if os.path.exists(cache_file):
+    # Check if results are already cached (skip if cache_file is None)
+    if cache_file and os.path.exists(cache_file):
         with open(cache_file, 'r') as f:
             cache = json.load(f)
         if cache_key in cache and split in cache[cache_key]:
@@ -299,34 +299,85 @@ def predict_on_dataset(model_path, dataset, split='test', batch_size=32, device=
         metrics = compute_metrics((np.array(all_probabilities), np.array(all_labels)))
         result['metrics'] = metrics
     
-    # Save to cache with compact format for lists
-    print(f"Saving results to {cache_file}")
-    if cache_key not in cache:
-        cache[cache_key] = {}
-    cache[cache_key][split] = result
-    cache_dir = osp.dirname(cache_file)
-    if cache_dir:
-        os.makedirs(cache_dir, exist_ok=True)
-    with open(cache_file, 'w') as f:
-        json.dump(cache, f, indent=2, separators=(',', ': '))
-    
-    # Rewrite with compact lists
-    with open(cache_file, 'r') as f:
-        content = f.read()
-    
-    # Replace multiline lists with single-line compact format
-    import re
-    content = re.sub(
-        r'"(predictions|labels)":\s*\[\s*((?:\d+,?\s*)+)\]',
-        lambda m: f'"{m.group(1)}": [{", ".join(m.group(2).replace(",", "").split())}]',
-        content,
-        flags=re.MULTILINE | re.DOTALL
-    )
-    
-    with open(cache_file, 'w') as f:
-        f.write(content)
+    # Save to cache with compact format for lists (skip if cache_file is None)
+    if cache_file:
+        print(f"Saving results to {cache_file}")
+        if cache_key not in cache:
+            cache[cache_key] = {}
+        cache[cache_key][split] = result
+        cache_dir = osp.dirname(cache_file)
+        if cache_dir:
+            os.makedirs(cache_dir, exist_ok=True)
+        with open(cache_file, 'w') as f:
+            json.dump(cache, f, indent=2, separators=(',', ': '))
+        
+        # Rewrite with compact lists
+        with open(cache_file, 'r') as f:
+            content = f.read()
+        
+        # Replace multiline lists with single-line compact format
+        import re
+        content = re.sub(
+            r'"(predictions|labels)":\s*\[\s*((?:\d+,?\s*)+)\]',
+            lambda m: f'"{m.group(1)}": [{", ".join(m.group(2).replace(",", "").split())}]',
+            content,
+            flags=re.MULTILINE | re.DOTALL
+        )
+        
+        with open(cache_file, 'w') as f:
+            f.write(content)
     
     return result
+
+
+def run_inference(weights, csv):
+    """
+    Run inference on a CSV file using a trained model.
+    
+    Args:
+        weights: Path to the trained model weights directory
+        csv: Path to the CSV file containing 'text' and optionally 'label' columns
+    
+    Returns:
+        list: List of predicted class indices
+    """
+    # Load the CSV file as a dataset
+    dataset = load_dataset('csv', data_files={'test': csv})
+    
+    # Load label mapping to configure the dataset
+    idx2label, label2idx = load_label_mapping()
+    
+    # If the CSV has labels, cast them to ClassLabel
+    if 'label' in dataset['test'].features:
+        # Replace integer labels with class names if they're integers
+        def replace_labels(examples):
+            examples['label'] = [idx2label[label] if isinstance(label, int) else label for label in examples['label']]
+            return examples
+        
+        dataset = dataset.map(replace_labels, batched=True)
+        
+        # Cast label column to ClassLabel
+        label_names = [idx2label[i] for i in sorted(idx2label.keys())]
+        dataset = dataset.cast_column('label', ClassLabel(names=label_names))
+    
+    # Run prediction without caching to avoid conflicts
+    results = predict_on_dataset(
+        model_path=weights,
+        dataset=dataset,
+        split='test',
+        cache_file=None  # Disable caching for inference-only runs
+    )
+    
+    # Print metrics if available
+    if 'metrics' in results:
+        print("\nInference Metrics:")
+        print("-" * 50)
+        for metric_name, metric_value in results['metrics'].items():
+            print(f"{metric_name}: {metric_value:.4f}")
+        print("-" * 50)
+    
+    return results['predictions']
+
 
 class CSVLoggingCallback(TrainerCallback):
     def __init__(self, output_dir):
