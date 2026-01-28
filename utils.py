@@ -734,9 +734,9 @@ def iterative_with_trainer(teacher_model, processed_dataset, tokenizer, layers_t
         print("Student params:", count_parameters(student)[0])
 
         if step == len(layers_to_drop) - 1:
-            step_save_path = os.path.join(save_dir, loss)
+            step_save_path = os.path.join(save_dir, f"with_{loss}")
         else:
-            step_save_path = os.path.join(save_dir, f"not_final_step")
+            step_save_path = os.path.join(save_dir, f"step{step}")
 
         trainer = CompressionTrainer(
             loss_name=loss,
@@ -756,6 +756,65 @@ def iterative_with_trainer(teacher_model, processed_dataset, tokenizer, layers_t
         trainer.train_model()
         
         current_teacher = copy.deepcopy(trainer.student).cpu().eval()
+
+
+        print("\nIterative distillation finished!")
+        print(f"Final student is saved in: {step_save_path}")
+    return step_save_path  # folder of the final student
+
+def iterative_with_trainer_same_teacher(teacher_model, processed_dataset, tokenizer, layers_to_drop, loss, data_collator, save_dir="students_iterative"): 
+    """
+    Iterative distillation using copy.deepcopy + layer popping with your Trainer class.
+
+    teacher_model: HuggingFace teacher model (frozen)
+    train_dataloader, val_dataloader: HuggingFace DataLoaders`
+    tokenizer: tokenizer for saving/loading
+    layers_to_drop: list of layers to drop in order (top layers first)
+    num_epochs_per_student: number of epochs for each student
+    save_dir: folder to save each student model
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    teacher = teacher_model
+    current_student = copy.deepcopy(teacher)
+    for step, layer_idx in enumerate(layers_to_drop):
+        print(f"\n--- Iteration {step}/{len(layers_to_drop)} ---")
+        print(f"Dropping layer {layer_idx} for this student")
+
+        # student imitate teacher
+        student = copy.deepcopy(current_student)
+
+        # Drop the specified layer
+        student.electra.encoder.layer.pop(layer_idx)
+        student.config.num_hidden_layers -= 1
+        for param in student.parameters():
+            param.requires_grad = True
+
+        print("Teacher params:", count_parameters(current_student)[0])
+        print("Student params:", count_parameters(student)[0])
+
+        if step == len(layers_to_drop) - 1:
+            step_save_path = os.path.join(save_dir, f"{loss}")
+        else:
+            step_save_path = os.path.join(save_dir, f"{step}")
+
+        trainer = CompressionTrainer(
+            loss_name=loss,
+            teacher=teacher, # Use the model from last step
+            student=student,         # new student
+            dataset=processed_dataset,
+            data_collator=data_collator,
+            tokenizer=tokenizer,
+            weights=calc_class_weights(processed_dataset['train']),
+            path=step_save_path
+            )
+    
+        trainer.inialize_training()
+
+        trainer.early_stop = False 
+        
+        trainer.train_model()
+        
+        current_student = copy.deepcopy(trainer.student).cpu().eval()
 
 
         print("\nIterative distillation finished!")

@@ -800,3 +800,98 @@ def display_results(predictions_json_path='cached_results/predictions.json'):
     df = df.sort_values('F1 Score', ascending=False).reset_index(drop=True)
     
     return df
+
+def time_performance_compression1(dir_name, is_step, predict_on_dataset, preprocessed_dataset):
+    if is_step:
+        dir_name = os.path.join(dir_name, "step")
+    
+    model_paths = {
+        "Full": "./origin_model",
+        "step1": dir_name + "0",
+        "step2": dir_name + "1",
+        "step3": dir_name + "2",
+        "step4": dir_name + "3",
+        "step5": dir_name + "4",
+    }
+    model_paths["step6"] = os.path.join(dir_name, "with_ce") if is_step else os.path.join(dir_name, "ce")
+    
+    rows = []
+    for name, path in model_paths.items():
+        res = predict_on_dataset(path, preprocessed_dataset)
+        metrics = res["metrics"]
+        rows.append({
+            "model": name,
+            "f1": metrics["f1"],
+            "runtime_ms": res["time_per_sample_mean"] * 1000,
+        })
+
+    df = pd.DataFrame(rows)
+    
+    # Calculate Speedup relative to 'Full'
+    full_runtime = df.loc[df['model'] == 'Full', 'runtime_ms'].values[0]
+    df['speedup'] = full_runtime / df['runtime_ms']
+
+    plt.figure(figsize=(10, 6))
+    
+    frontier = df.sort_values("runtime_ms")
+
+    # A point is on the frontier if no other point has higher F1 AND lower runtime
+    plt.plot(frontier["runtime_ms"], frontier["f1"], 'r--', alpha=0.3, label="Efficiency Frontier")
+
+    for _, row in df.iterrows():
+        color = 'black' if row['model'] == 'Full' else '#1f77b4'
+        marker = 'D' if row['model'] == 'Full' else 'o'
+        
+        plt.scatter(row["runtime_ms"], row["f1"], c=color, marker=marker, s=100, edgecolors='white', zorder=5)
+        
+        label = f"{row['model']}\n({row['speedup']:.2f}x)" if row['model'] != 'Full' else "Full Model"
+        plt.annotate(
+            label,
+            (row["runtime_ms"], row["f1"]),
+            xytext=(7, 7),
+            textcoords="offset points",
+            fontsize=9,
+            fontweight='bold' if row['model'] == 'Full' else 'normal'
+        )
+
+    plt.xlabel("Inference Time per Sample [ms]", fontsize=12)
+    plt.ylabel("Macro F1", fontsize=12)
+    plt.title("Compression Efficiency: F1 Score vs. Latency", fontsize=14, pad=20)
+    
+    plt.grid(True, linestyle='--', alpha=0.6)
+    
+    plt.legend(loc='lower right')
+    plt.tight_layout()
+    plt.show()
+
+    return df
+
+def plot_percentage_trends(df):
+    # Normalize to 'Full' model as 100%
+    full_row = df[df['model'] == 'Full'].iloc[0]
+    df = df.copy()
+    df['f1_pct'] = (df['f1'] / full_row['f1']) * 100
+    df['runtime_pct'] = (df['runtime_ms'] / full_row['runtime_ms']) * 100
+    
+    # Chnage full name to step 0
+    df['sort_idx'] = df['model'].apply(lambda x: 0 if x == 'Full' else int(''.join(filter(str.isdigit, x)) or 99))
+    df = df.sort_values('sort_idx')
+
+    plt.figure(figsize=(10, 6))
+    # F1 Retention Line (The "Stability" line)
+    plt.plot(df['model'], df['f1_pct'], marker='o', linewidth=3, color='#1f77b4', label='F1 Retention (%)')
+    
+    # Runtime Line (The "Efficiency" line)
+    plt.plot(df['model'], df['runtime_pct'], marker='s', linewidth=3, color='#ff7f0e', linestyle='--', label='Relative Runtime (%)')
+
+    plt.axhline(100, color='black', linestyle='-', alpha=0.2) # 100% baseline
+
+    plt.ylabel("Percentage of Original Model (%)", fontsize=12)
+    plt.xlabel("Pruning Iteration", fontsize=12)
+    plt.ylim(df['runtime_pct'].min() - 10, 110)
+    plt.grid(True, axis='y', linestyle=':', alpha=0.7)
+
+
+    plt.legend(loc='lower left', frameon=True, shadow=True)
+    plt.tight_layout()
+    plt.show()
