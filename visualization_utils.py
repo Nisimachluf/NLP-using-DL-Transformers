@@ -584,17 +584,6 @@ def plot_feature_comparison(pretrained_model_paths, finetuned_model_paths, datas
         if selected_model_name and (selected_model_name == pre_name or selected_model_name == fine_name):
             selected_pair = model_pairs[-1]
     
-    # Print separability metrics summary
-    print("\n=== Separability Metrics Summary ===")
-    for pair in model_pairs:
-        print(f"\nModel: {pair['pretrained_name']}")
-        print(f"  Pretrained:")
-        print(f"    Adjusted Rand Index: {pair['pretrained_metrics']['adjusted_rand_index']:.4f}")
-        print(f"    Adjusted Mutual Info: {pair['pretrained_metrics']['adjusted_mutual_info']:.4f}")
-        print(f"  Finetuned:")
-        print(f"    Adjusted Rand Index: {pair['finetuned_metrics']['adjusted_rand_index']:.4f}")
-        print(f"    Adjusted Mutual Info: {pair['finetuned_metrics']['adjusted_mutual_info']:.4f}")
-    
     # If selected_model is specified and found, save it separately
     if selected_model and selected_model_fpath and selected_pair:
         fig_single, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 5))
@@ -750,3 +739,64 @@ def plot_model_family_frontiers(predictions_cache_path='cached_results/predictio
         plt.savefig(f'{fname}.jpg', format='jpg', dpi=200, bbox_inches='tight')
     
     plt.show()
+    
+    
+def display_results(predictions_json_path='cached_results/predictions.json'):
+    """
+    Parse the predictions.json file and construct a DataFrame with metrics.
+    
+    Args:
+        predictions_json_path: Path to the predictions JSON file
+        
+    Returns:
+        pd.DataFrame: DataFrame with columns: model_name, accuracy, recall, precision, f1, time_per_sample_ms
+    """
+    # Load the JSON file
+    with open(predictions_json_path, 'r') as f:
+        predictions_data = json.load(f)
+    
+    # Define proper names for model families
+    family_names = {'electra': 'ELECTRA', 'roberta': 'RoBERTa', 'deberta': 'DeBERTa'}
+    
+    # Prepare data for DataFrame
+    rows = []
+    for model_name, model_results in predictions_data.items():
+        test_metrics = model_results['test']['metrics']
+        time_per_sample = model_results['test']['time_per_sample_mean']
+        
+        # Convert time to milliseconds
+        time_per_sample_ms = time_per_sample * 1000
+        
+        # Map model name to proper format (e.g., electra-small -> ELECTRA-small)
+        parts = model_name.split('-')
+        family = parts[0]
+        size = '-'.join(parts[1:])  # Handle cases like "electra-base" or potential multi-part names
+        formatted_name = f"{family_names.get(family, family.upper())}-{size}"
+        
+        row = {
+            'model_name': formatted_name,
+            'accuracy': test_metrics['accuracy'],
+            'recall': test_metrics['recall'],
+            'precision': test_metrics['precision'],
+            'f1': test_metrics['f1'],
+            'time_per_sample_ms': time_per_sample_ms
+        }
+        rows.append(row)
+    
+    # Create DataFrame
+    df = pd.DataFrame(rows)
+    
+    # Rename columns for display
+    df = df.rename(columns={
+        'model_name': 'Model',
+        'accuracy': 'Accuracy',
+        'recall': 'Recall',
+        'precision': 'Precision',
+        'f1': 'F1 Score',
+        'time_per_sample_ms': 'Inference Time (ms)'
+    })
+    
+    # Sort by F1 Score in descending order
+    df = df.sort_values('F1 Score', ascending=False).reset_index(drop=True)
+    
+    return df

@@ -5,3 +5,4 @@ trained_weights
 __pycache__
 .ipynb_checkpoints
 *Thumbs.db
+single_step

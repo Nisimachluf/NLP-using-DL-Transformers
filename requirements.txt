@@ -15,3 +15,7 @@ ekphrasis
 beautifulsoup4
 lxml
 umap-learn
+numpy
+pandas
+tqdm
+huggingface_hub
