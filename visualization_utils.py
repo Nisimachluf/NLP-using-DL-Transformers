@@ -801,23 +801,26 @@ def display_results(predictions_json_path='cached_results/predictions.json'):
     
     return df
 
-def time_performance_compression1(dir_name, is_step, predict_on_dataset, preprocessed_dataset):
-    if is_step:
-        dir_name = os.path.join(dir_name, "step")
+def time_performance_compression1(models, is_step, predict_on_dataset, preprocessed_dataset, **prediction_kwargs):
+
     
     model_paths = {
-        "Full": "./origin_model",
-        "step1": dir_name + "0",
-        "step2": dir_name + "1",
-        "step3": dir_name + "2",
-        "step4": dir_name + "3",
-        "step5": dir_name + "4",
-    }
-    model_paths["step6"] = os.path.join(dir_name, "with_ce") if is_step else os.path.join(dir_name, "ce")
+        "Full": "nisimachluf/electra-base-tweet-classification"}
+#         "step1": step_dir_name + "0",
+#         "step2": step_dir_name + "1",
+#         "step3": step_dir_name + "2",
+#         "step4": step_dir_name + "3",
+#         "step5": step_dir_name + "4",
+#     }
+#     model_paths["step6"] = os.path.join(dir_name, "with_ce") if is_step else os.path.join(dir_name, "ce")
+    for i, model in enumerate(models):
+        model_paths[f"step{i}"] = model
+        
     
     rows = []
     for name, path in model_paths.items():
-        res = predict_on_dataset(path, preprocessed_dataset)
+        print(name, path)
+        res = predict_on_dataset(path, preprocessed_dataset, **prediction_kwargs)
         metrics = res["metrics"]
         rows.append({
             "model": name,

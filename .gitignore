@@ -6,3 +6,4 @@ __pycache__
 .ipynb_checkpoints
 *Thumbs.db
 single_step
+iterative_steps*

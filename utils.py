@@ -177,7 +177,7 @@ def create_model_stats_csv(trained_weights_dir='trained_weights', output_csv='mo
     print(f"Model statistics saved to {output_csv}")
 
 
-def predict_on_dataset(model_path, dataset, split='test', batch_size=32, device=None, cache_file='predictions.json'):
+def predict_on_dataset(model_path, dataset, split='test', batch_size=32, device=None, cache_file='predictions.json', name_extension_len=2):
     """
     Load a model and make predictions on a dataset split.
     
@@ -202,7 +202,10 @@ def predict_on_dataset(model_path, dataset, split='test', batch_size=32, device=
     from tqdm import tqdm
     
     # Extract model name from path for caching
-    model_name = "-".join(model_path.split('/')[-1].split("-")[:2])
+    if name_extension_len > 0:
+        model_name = "-".join(model_path.split('/')[-1].split("-")[:name_extension_len])
+    else:
+        model_name = model_path.split('/')[-1]
     cache_key = f"{model_name}"
     
     # Check if results are already cached (skip if cache_file is None)
@@ -844,9 +847,9 @@ def iterative_with_trainer_same_teacher(teacher_model, processed_dataset, tokeni
         print("Student params:", count_parameters(student)[0])
 
         if step == len(layers_to_drop) - 1:
-            step_save_path = os.path.join(save_dir, f"{loss}")
+            step_save_path = os.path.join(save_dir, f"with_{loss}")
         else:
-            step_save_path = os.path.join(save_dir, f"{step}")
+            step_save_path = os.path.join(save_dir, f"step{step}")
 
         trainer = CompressionTrainer(
             loss_name=loss,
