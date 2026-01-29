@@ -104,6 +104,12 @@ pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
+4. **Create a .env file**:
+Create a `.env` file in the project root:
+```bash
+echo 'HF_TOKEN="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"' > .env
+```
+
 ## Project Structure
 
 ```
