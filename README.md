@@ -86,7 +86,7 @@ Compressed models are available under:
 
 1. **Clone the repository**:
 ```bash
-git clone <repository-url>
+git clone https://github.com/Nisimachluf/NLP-using-DL-Transformers.git
 cd NLP-using-DL-Transformers
 ```
 
