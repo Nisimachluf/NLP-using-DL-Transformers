@@ -327,7 +327,7 @@ def plot_training_curves(trained_weights_dir='trained_weights', fname=None):
 def plot_feature_comparison(pretrained_model_paths, finetuned_model_paths, dataset, 
                             label_mapping_path='classes.json', fname=None, 
                             selected_model=None, selected_model_fpath=None,
-                            method='tsne', features_cache_dir='features',
+                            method='tsne', features_cache_file='cached_results/features_cache.npz',
                             metrics_cache_file='feature_separability_metrics.json'):
     """
     Extract features from pretrained and finetuned model pairs, reduce dimensionality to 2D, 
@@ -342,7 +342,7 @@ def plot_feature_comparison(pretrained_model_paths, finetuned_model_paths, datas
         selected_model: Optional model name to save separately (should be in one of the model lists)
         selected_model_fpath: File path to save the selected model's plot separately (without extension)
         method: Dimensionality reduction method - 'tsne', 'pca', or 'umap' (default: 'tsne')
-        features_cache_dir: Directory to cache extracted features (default: 'features')
+        features_cache_file: Path to NPZ file to cache extracted features (default: 'cached_results/features/features_cache.npz')
         metrics_cache_file: JSON file to cache all separability metrics (default: 'feature_separability_metrics.json')
     """
     import matplotlib.pyplot as plt
@@ -399,11 +399,15 @@ def plot_feature_comparison(pretrained_model_paths, finetuned_model_paths, datas
     else:
         all_metrics = {}
     
-    def get_cache_path(model_name, model_type):
-        """Generate cache file path for features"""
-        os.makedirs(features_cache_dir, exist_ok=True)
+    # Ensure directory for NPZ file exists
+    cache_dir = os.path.dirname(features_cache_file)
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+    
+    def get_cache_key(model_name, model_type):
+        """Generate cache key for features in NPZ file"""
         safe_name = model_name.replace('/', '_')
-        return os.path.join(features_cache_dir, f"{safe_name}_{model_type}_{method}.npy")
+        return f"{safe_name}_{model_type}"
     
     def save_metrics_to_cache(model_name, model_type, metrics):
         """Save metrics to the global metrics cache file"""
@@ -440,24 +444,29 @@ def plot_feature_comparison(pretrained_model_paths, finetuned_model_paths, datas
     
     def extract_and_reduce_features(model_path, model_name, model_type="finetuned"):
         """Extract features and apply dimensionality reduction with caching"""
-        cache_path = get_cache_path(model_name, model_type)
+        cache_key = get_cache_key(model_name, model_type)
         
-        # Check cache
-        if os.path.exists(cache_path):
-            print(f"Loading cached {method.upper()} features for {model_name} ({model_type})")
-            features_2d = np.load(cache_path)
-            
-            # Check if metrics are cached
-            metrics = get_metrics_from_cache(model_name, model_type)
-            if metrics:
-                print(f"Loading cached metrics for {model_name} ({model_type})")
+        # Check cache in NPZ file
+        if os.path.exists(features_cache_file):
+            cached_data = np.load(features_cache_file)
+            if cache_key in cached_data:
+                print(f"Loading cached {method.upper()} features for {model_name} ({model_type})")
+                features_2d = cached_data[cache_key]
+                cached_data.close()
+                
+                # Check if metrics are cached
+                metrics = get_metrics_from_cache(model_name, model_type)
+                if metrics:
+                    print(f"Loading cached metrics for {model_name} ({model_type})")
+                else:
+                    # Calculate and cache metrics
+                    print(f"Calculating separability metrics for {model_name} ({model_type})")
+                    metrics = calculate_separability_metrics(features_2d, np.array(labels))
+                    save_metrics_to_cache(model_name, model_type, metrics)
+                
+                return features_2d, metrics
             else:
-                # Calculate and cache metrics
-                print(f"Calculating separability metrics for {model_name} ({model_type})")
-                metrics = calculate_separability_metrics(features_2d, np.array(labels))
-                save_metrics_to_cache(model_name, model_type, metrics)
-            
-            return features_2d, metrics
+                cached_data.close()
         
         print(f"Extracting features for {model_name} ({model_type})...")
         
@@ -501,9 +510,16 @@ def plot_feature_comparison(pretrained_model_paths, finetuned_model_paths, datas
         else:
             raise ValueError(f"Unknown method: {method}. Choose from 'tsne', 'pca', or 'umap'.")
         
-        # Cache the results
-        np.save(cache_path, features_2d)
-        print(f"Cached features to {cache_path}")
+        # Cache the results in NPZ file
+        if os.path.exists(features_cache_file):
+            # Load existing data
+            existing_data = dict(np.load(features_cache_file))
+            existing_data[cache_key] = features_2d
+            np.savez(features_cache_file, **existing_data)
+        else:
+            # Create new NPZ file
+            np.savez(features_cache_file, **{cache_key: features_2d})
+        print(f"Cached features to {features_cache_file} under key '{cache_key}'")
         
         # Calculate and cache separability metrics
         print(f"Calculating separability metrics for {model_name} ({model_type})")
@@ -513,18 +529,19 @@ def plot_feature_comparison(pretrained_model_paths, finetuned_model_paths, datas
         
         return features_2d, metrics
     
-    def plot_scatter(ax, features_2d, title, metrics=None):
+    def plot_scatter(ax, features_2d, title, metrics=None, show_title=True, marker_size=25, legend_fontsize=6):
         """Plot scatter plot on given axes"""
         for label in unique_labels:
             mask = np.array(labels) == label
             ax.scatter(features_2d[mask, 0], features_2d[mask, 1], 
                       c=[color_map[label]], label=idx2label[label], 
-                      alpha=0.6, s=25, edgecolors='black', linewidth=0.5)
+                      alpha=0.6, s=marker_size, edgecolors='black', linewidth=0.5)
         
-        ax.set_title(title, fontsize=12, fontweight='bold')
+        if show_title:
+            ax.set_title(title, fontsize=12, fontweight='bold')
         ax.set_xlabel(f'{method.upper()} Component 1', fontsize=8)
         ax.set_ylabel(f'{method.upper()} Component 2', fontsize=8)
-        ax.legend(fontsize=6, loc='lower right')
+        ax.legend(fontsize=legend_fontsize, loc='lower right')
         ax.grid(True, alpha=0.3)
         
         # Add metrics text box if provided
@@ -567,25 +584,14 @@ def plot_feature_comparison(pretrained_model_paths, finetuned_model_paths, datas
         if selected_model_name and (selected_model_name == pre_name or selected_model_name == fine_name):
             selected_pair = model_pairs[-1]
     
-    # Print separability metrics summary
-    print("\n=== Separability Metrics Summary ===")
-    for pair in model_pairs:
-        print(f"\nModel: {pair['pretrained_name']}")
-        print(f"  Pretrained:")
-        print(f"    Adjusted Rand Index: {pair['pretrained_metrics']['adjusted_rand_index']:.4f}")
-        print(f"    Adjusted Mutual Info: {pair['pretrained_metrics']['adjusted_mutual_info']:.4f}")
-        print(f"  Finetuned:")
-        print(f"    Adjusted Rand Index: {pair['finetuned_metrics']['adjusted_rand_index']:.4f}")
-        print(f"    Adjusted Mutual Info: {pair['finetuned_metrics']['adjusted_mutual_info']:.4f}")
-    
     # If selected_model is specified and found, save it separately
     if selected_model and selected_model_fpath and selected_pair:
-        fig_single, (ax1, ax2) = plt.subplots(1, 2, figsize=(9, 4))
+        fig_single, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 5))
         
         plot_scatter(ax1, selected_pair['pretrained_features'], selected_pair['pretrained_name'], 
-                    selected_pair['pretrained_metrics'])
+                    selected_pair['pretrained_metrics'], show_title=False)
         plot_scatter(ax2, selected_pair['finetuned_features'], selected_pair['finetuned_name'],
-                    selected_pair['finetuned_metrics'])
+                    selected_pair['finetuned_metrics'], show_title=False)
         
         plt.tight_layout()
         
@@ -601,7 +607,7 @@ def plot_feature_comparison(pretrained_model_paths, finetuned_model_paths, datas
     n_cols = 2
     n_rows = n_pairs
     
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(9, 4 * n_rows))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(11, 5 * n_rows))
     
     # Flatten axes array if needed
     if n_rows == 1:
@@ -610,9 +616,9 @@ def plot_feature_comparison(pretrained_model_paths, finetuned_model_paths, datas
     # Plot all pairs
     for idx, pair in enumerate(model_pairs):
         plot_scatter(axes[idx, 0], pair['pretrained_features'], pair['pretrained_name'],
-                    pair['pretrained_metrics'])
+                    pair['pretrained_metrics'], marker_size=50, legend_fontsize=8)
         plot_scatter(axes[idx, 1], pair['finetuned_features'], pair['finetuned_name'],
-                    pair['finetuned_metrics'])
+                    pair['finetuned_metrics'], marker_size=50, legend_fontsize=8)
     
     plt.tight_layout()
     
@@ -624,6 +630,176 @@ def plot_feature_comparison(pretrained_model_paths, finetuned_model_paths, datas
         plt.savefig(f'{fname}.jpg', format='jpg', dpi=200, bbox_inches='tight')
     
     plt.show()
+
+
+def plot_model_family_frontiers(predictions_cache_path='cached_results/predictions.json', fname=None):
+    """
+    Plot frontier plots for all model families on a single axis showing the trade-off between inference speed and F1 score.
+    
+    Creates a single plot with all model families (e.g., ELECTRA, RoBERTa, DeBERTa), with:
+    - X-axis: time_per_sample_mean (inference speed in milliseconds)
+    - Y-axis: F1 score (percentage)
+    
+    Args:
+        predictions_cache_path: Path to JSON file containing model predictions (default: 'cached_results/predictions.json')
+        fname: Optional file path to save the figure (without extension, will be saved as .jpg)
+    """
+    # Load predictions cache
+    with open(predictions_cache_path, 'r') as f:
+        predictions_cache = json.load(f)
+    
+    # Extract data for each model
+    model_data = {}
+    for model_name, results in predictions_cache.items():
+        test_data = results['test']
+        time_per_sample = test_data['time_per_sample_mean']
+        f1_score = test_data['metrics']['f1']
+        
+        # Extract model family (e.g., 'electra' from 'electra-small')
+        family = model_name.split('-')[0]
+        
+        if family not in model_data:
+            model_data[family] = {
+                'models': [],
+                'times': [],
+                'f1_scores': []
+            }
+        
+        model_data[family]['models'].append(model_name)
+        model_data[family]['times'].append(time_per_sample * 1000)  # Convert to milliseconds
+        model_data[family]['f1_scores'].append(f1_score * 100)  # Convert to percentage
+    
+    # Create single plot
+    fig, ax = plt.subplots(figsize=(5, 4))
+    
+    # Define colors for different model families
+    family_colors = {'electra': '#1f77b4', 'roberta': '#ff7f0e', 'deberta': '#2ca02c'}
+    # Define markers for different model sizes
+    size_markers = {'small': 'o', 'base': 's', 'large': '^'}
+    # Define proper names for model families
+    family_names = {'roberta': 'RoBERTa', 'electra': 'ELECTRA', 'deberta': 'DeBERTa'}
+    
+    # Track which combinations have been plotted for legend
+    legend_elements = []
+    plotted_combinations = set()
+    
+    for family, data in sorted(model_data.items()):
+        family_color = family_colors.get(family, '#1f77b4')
+        
+        # Plot each model
+        for model, time, f1 in zip(data['models'], data['times'], data['f1_scores']):
+            # Extract size from model name
+            size = 'base'  # default
+            if 'small' in model:
+                size = 'small'
+            elif 'large' in model:
+                size = 'large'
+            
+            marker = size_markers.get(size, 's')
+            
+            # Create label for this combination
+            combo_key = (family, size)
+            family_display = family_names.get(family, family.upper())
+            label = f'{family_display}-{size}' if combo_key not in plotted_combinations else None
+            if label:
+                plotted_combinations.add(combo_key)
+            
+            ax.scatter(time, f1, c=family_color, marker=marker, s=100, 
+                      edgecolors='black', linewidth=1, alpha=0.8, zorder=3,
+                      label=label)
+        
+        # Connect points with a line (frontier) for each family
+        sorted_indices = np.argsort(data['times'])
+        sorted_times = [data['times'][i] for i in sorted_indices]
+        sorted_f1s = [data['f1_scores'][i] for i in sorted_indices]
+        ax.plot(sorted_times, sorted_f1s, color=family_color, linestyle='--', 
+               alpha=0.5, linewidth=1.5, zorder=1)
+    
+    # Formatting
+    ax.set_xlabel('Inference Time per Sample (ms)', fontsize=9, fontweight='bold')
+    ax.set_ylabel('F1 Score', fontsize=9, fontweight='bold')
+    ax.grid(True, alpha=0.3, linestyle='--')
+    
+    # Add legend
+    ax.legend(fontsize=7, loc='lower right', framealpha=0.9, ncol=2)
+    
+    # Set axis limits with some padding
+    all_times = [t for data in model_data.values() for t in data['times']]
+    all_f1s = [f1 for data in model_data.values() for f1 in data['f1_scores']]
+    ax.set_xlim([min(all_times) * 0.95, max(all_times) * 1.05])
+    ax.set_ylim([min(all_f1s) - 0.5, max(all_f1s) + 0.5])
+    
+    plt.tight_layout()
+    
+    if fname:
+        # Ensure the directory exists
+        directory = os.path.dirname(fname)
+        if directory and not os.path.exists(directory):
+            os.makedirs(directory, exist_ok=True)
+        plt.savefig(f'{fname}.jpg', format='jpg', dpi=200, bbox_inches='tight')
+    
+    plt.show()
+    
+    
+def display_results(predictions_json_path='cached_results/predictions.json'):
+    """
+    Parse the predictions.json file and construct a DataFrame with metrics.
+    
+    Args:
+        predictions_json_path: Path to the predictions JSON file
+        
+    Returns:
+        pd.DataFrame: DataFrame with columns: model_name, accuracy, recall, precision, f1, time_per_sample_ms
+    """
+    # Load the JSON file
+    with open(predictions_json_path, 'r') as f:
+        predictions_data = json.load(f)
+    
+    # Define proper names for model families
+    family_names = {'electra': 'ELECTRA', 'roberta': 'RoBERTa', 'deberta': 'DeBERTa'}
+    
+    # Prepare data for DataFrame
+    rows = []
+    for model_name, model_results in predictions_data.items():
+        test_metrics = model_results['test']['metrics']
+        time_per_sample = model_results['test']['time_per_sample_mean']
+        
+        # Convert time to milliseconds
+        time_per_sample_ms = time_per_sample * 1000
+        
+        # Map model name to proper format (e.g., electra-small -> ELECTRA-small)
+        parts = model_name.split('-')
+        family = parts[0]
+        size = '-'.join(parts[1:])  # Handle cases like "electra-base" or potential multi-part names
+        formatted_name = f"{family_names.get(family, family.upper())}-{size}"
+        
+        row = {
+            'model_name': formatted_name,
+            'accuracy': test_metrics['accuracy'],
+            'recall': test_metrics['recall'],
+            'precision': test_metrics['precision'],
+            'f1': test_metrics['f1'],
+            'time_per_sample_ms': time_per_sample_ms
+        }
+        rows.append(row)
+    
+    # Create DataFrame
+    df = pd.DataFrame(rows)
+    
+    # Rename columns for display
+    df = df.rename(columns={
+        'model_name': 'Model',
+        'accuracy': 'Accuracy',
+        'recall': 'Recall',
+        'precision': 'Precision',
+        'f1': 'F1 Score',
+        'time_per_sample_ms': 'Inference Time (ms)'
+    })
+    
+    # Sort by F1 Score in descending order
+    df = df.sort_values('F1 Score', ascending=False).reset_index(drop=True)
+    
+    return df
 
 def time_performance_compression1(dir_name, is_step, predict_on_dataset, preprocessed_dataset):
     if is_step:
@@ -679,7 +855,7 @@ def time_performance_compression1(dir_name, is_step, predict_on_dataset, preproc
         )
 
     plt.xlabel("Inference Time per Sample [ms]", fontsize=12)
-    plt.ylabel("Macro F1", fontsize=12)
+    plt.ylabel("F1", fontsize=12)
     plt.title("Compression Efficiency: F1 Score vs. Latency", fontsize=14, pad=20)
     
     plt.grid(True, linestyle='--', alpha=0.6)
