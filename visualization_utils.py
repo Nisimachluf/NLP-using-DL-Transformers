@@ -855,7 +855,7 @@ def time_performance_compression1(dir_name, is_step, predict_on_dataset, preproc
         )
 
     plt.xlabel("Inference Time per Sample [ms]", fontsize=12)
-    plt.ylabel("Macro F1", fontsize=12)
+    plt.ylabel("F1", fontsize=12)
     plt.title("Compression Efficiency: F1 Score vs. Latency", fontsize=14, pad=20)
     
     plt.grid(True, linestyle='--', alpha=0.6)
