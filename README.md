@@ -69,12 +69,12 @@ All fine-tuned models are available on HuggingFace Hub under `nisimachluf/`:
 - `nisimachluf/roberta-large-tweet-classification`
 - `nisimachluf/deberta-base-tweet-classification`
 
-Compressed models are available under `Yahav/`:
-- `Yahav/electra-base-compressed-single-step-hybrid`
-- `Yahav/electra-base-compressed-single-step-pruning`
-- `Yahav/electra-base-compressed-single-step-ST`
-- `Yahav/electra-base-compressed-iterative-approach-pruning`
-- `Yahav/electra-base-compressed-iterative-approach-hybrid`
+Compressed models are available under:
+- `nisimachluf/electra-base-compressed-single-step-hybrid`
+- `nisimachluf/electra-base-compressed-single-step-pruning`
+- `nisimachluf/electra-base-compressed-single-step-ST`
+- `nisimachluf/electra-base-compressed-iterative-approach-pruning`
+- `nisimachluf/electra-base-compressed-iterative-approach-hybrid`
 
 ## Installation
 
@@ -104,12 +104,6 @@ pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-4. **Set up HuggingFace authentication** (optional, for model upload):
-Create a `.env` file in the project root:
-```bash
-HF_TOKEN=your_huggingface_token_here
-```
-
 ## Project Structure
 
 ```
@@ -135,7 +129,7 @@ HF_TOKEN=your_huggingface_token_here
 
 ### Running Inference
 
-To run inference on new data using a trained model, use the `run_inference` function:
+To run inference on new data using a trained model, address the last cell in the notebook or follow this:
 
 ```python
 from utils import run_inference
